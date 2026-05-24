@@ -1,9 +1,9 @@
 # ── Input ─────────────────────────────────────────────────────────────────────
-IMAGE_PATH = "/home/basil-k-aji/Desktop/Workspace/RD/website/animal-8518802_640_deer.jpg"
+IMAGE_PATH = "/home/basil-k-aji/Desktop/Workspace/RD/website/bear-8845470_640_bear.jpg"
 
 # Optional: the occluded object to reveal.
 # Leave empty ("") to let the model automatically detect what is occluded.
-TARGET = "deer"
+TARGET = "bear"
 
 # ── GPT (loaded from .env: OPENAI_MODEL, OPENAI_API_KEY) ─────────────────────
 GPT_MAX_TOKENS = 10192

@@ -142,6 +142,25 @@ Outputs land in `output/<image-stem>/_flux_cutout_person/`:
 - `offframe_final_*` — when the off-frame loop fires
 - `comparison.png` — 5-panel A/B/C/D/E walkthrough
 
+## Example
+
+End-to-end run on a same-class bear-occluding-bear scene (a hard case because InstaOrder needs to disambiguate two same-class subjects):
+
+| Input | Pipeline panels | Clean cutout |
+|---|---|---|
+| ![Bear input](docs/examples/bear/input.jpg) | ![Bear panels](docs/examples/bear/comparison.png) | ![Bear cutout](docs/examples/bear/output_white_bg.png) |
+
+Comparison panels left → right: **A** original • **B** green = visible target / magenta = dilated-occluder inpaint region • **C** Flux input (visible target cutout on gray) • **D** binary inpaint mask • **E** Flux output composited back into the scene.
+
+Stats:
+- Agent 1 (SAM3 + InstaOrder + GPT-5 reasoning='high'): **190 s**
+- Jiang Ao iter-0 inpaint mask: `dilate(occluder, 5×5, 3) ∖ visible` = **33,446 px**
+- Flux denoise (50 steps, sequential CPU offload): **550 s**
+- Off-frame iter: didn't fire (subject fully inside frame)
+- Final RGBA: alpha-blended with 5-px distance-transform feather
+
+Reproduce: edit `config.py` to point at the bear image, then `.venv/bin/python test_flux_cutout_person.py`.
+
 ## Key config flags
 
 All in `config.py`. Currently-validated defaults:

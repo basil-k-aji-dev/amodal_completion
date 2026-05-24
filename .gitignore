@@ -1,0 +1,53 @@
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── Virtual environments ───────────────────────────────────────────────
+.venv/
+venv/
+env/
+.python-version
+
+# ── Secrets ─────────────────────────────────────────────────────────────
+.env
+.env.local
+*.pem
+*.key
+credentials*
+
+# ── Pipeline outputs (generated per run, large) ────────────────────────
+output/
+runs/
+logs/
+*.log
+
+# ── Model checkpoints (re-downloaded from Hugging Face cache) ──────────
+ckpt/
+*.ckpt
+*.pt
+*.pth
+*.pth.tar
+*.safetensors
+*.bin
+*.ts
+*.gguf
+
+# ── Diffusers / HF cache (per-user) ────────────────────────────────────
+.cache/
+
+# ── IDE / editor ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# ── Large media incidental to runs ─────────────────────────────────────
+*.mp4
+*.mov
+*.avi

@@ -1,0 +1,19 @@
+[project]
+name = "amodal-test3"
+version = "0.1.0"
+description = "Amodal completion via GPT-5 + SDXL + LangGraph"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.30",
+    "python-dotenv>=1.0",
+    "langgraph>=0.2",
+    "diffusers>=0.27",
+    "accelerate>=0.29",
+    "torch>=2.0",
+    "Pillow>=10.0",
+    "opencv-python>=4.9",
+    "numpy>=1.24",
+    "sam2>=1.0",
+    "simple-lama-inpainting>=0.1.0",
+]

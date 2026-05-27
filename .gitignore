@@ -24,7 +24,9 @@ credentials*
 output/
 runs/
 logs/
+log/
 *.log
+!log/.gitkeep
 
 # ── Model checkpoints (re-downloaded from Hugging Face cache) ──────────
 ckpt/

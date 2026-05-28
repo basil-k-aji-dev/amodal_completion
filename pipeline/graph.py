@@ -30,6 +30,10 @@ from pipeline.state import State
 from pipeline.nodes import occlusion_agent, completion_agent, reviewer
 
 
+def _noop(state: State) -> State:
+    return state
+
+
 def route(state: State) -> str:
     score        = state.get("review_score", 0.0)
     failure_code = state.get("failure_code", "")
@@ -59,22 +63,30 @@ def route(state: State) -> str:
 def build_graph():
     g = StateGraph(State)
 
-    g.add_node("occlusion_agent",  occlusion_agent)
-    g.add_node("completion_agent", completion_agent)
-    g.add_node("reviewer",         reviewer)
+    use_occlusion  = bool(getattr(config, "USE_OCCLUSION_AGENT",  True))
+    use_completion = bool(getattr(config, "USE_COMPLETION_AGENT", True))
+    use_reviewer   = bool(getattr(config, "USE_REVIEWER",         False))
+
+    g.add_node("occlusion_agent",  occlusion_agent  if use_occlusion  else _noop)
+    g.add_node("completion_agent", completion_agent if use_completion else _noop)
+    g.add_node("reviewer",         reviewer         if use_reviewer   else _noop)
 
     g.set_entry_point("occlusion_agent")
-    g.add_edge("occlusion_agent",  "completion_agent")
-    g.add_edge("completion_agent", "reviewer")
-    g.add_conditional_edges(
-        "reviewer",
-        route,
-        {
-            "retry_mask":       "occlusion_agent",
-            "retry_completion": "completion_agent",
-            "end":              END,
-        },
-    )
+    g.add_edge("occlusion_agent", "completion_agent")
+
+    if use_reviewer:
+        g.add_edge("completion_agent", "reviewer")
+        g.add_conditional_edges(
+            "reviewer",
+            route,
+            {
+                "retry_mask":       "occlusion_agent",
+                "retry_completion": "completion_agent",
+                "end":              END,
+            },
+        )
+    else:
+        g.add_edge("completion_agent", END)
 
     return g.compile()
 

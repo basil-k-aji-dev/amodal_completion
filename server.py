@@ -37,6 +37,7 @@ from PIL import Image
 
 import config
 import runtime
+runtime.SERVER_MODE = True   # keep all models GPU-resident; disable free/unload
 from models import clip as clip_model
 from models import flux as flux_model
 from models import sam3 as sam3_model

@@ -2416,11 +2416,6 @@ original image.
         cv2.polylines(viz_out, [poly_used], True, (0, 200, 0), 2)
     if vis_poly_used is not None:
         cv2.polylines(viz_out, [vis_poly_used], True, (0, 255, 120), 2)
-    # Fix 2: draw hidden_polygon in cyan
-    if len(hidden_poly) >= 3:
-        pts_h = np.array([[int(p[0]), int(p[1])] for p in hidden_poly], dtype=np.int32)
-        cv2.polylines(viz_out, [pts_h], True, (255, 255, 0), 2)   # cyan
-        print(f"  Hidden polygon   : {len(hidden_poly)} pts drawn on viz")
 
     occ_viz_path = out_dir / "occluder_viz.png"
     cv2.imwrite(str(occ_viz_path), viz_out)
@@ -2806,7 +2801,7 @@ def completion_agent(state: State) -> dict:
     # 3-5 px get repainted by Flux instead.
     vis_b_eroded = cv2.erode(vis_b, np.ones((5, 5), np.uint8),
                              iterations=1).astype(np.uint8)
-    cutout = np.full_like(img_bgr, PAD_COLOR)
+    cutout = np.full_like(img_bgr, 255)   # white bg matches Jiang Ao amodal/main.py:697
     cutout[vis_b_eroded == 1] = img_bgr[vis_b_eroded == 1]
     cv2.imwrite(str(test_dir / "person_cutout.png"), cutout)
     cv2.imwrite(str(test_dir / "hidden_inpaint_mask.png"), hidden * 255)

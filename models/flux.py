@@ -9,13 +9,12 @@ config.INPAINT_BACKEND == "remote_flux".
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
 
 import config
-from runtime import DEVICE, _release_ram, free_all_except, register_free_fn
+from runtime import DEVICE, SERVER_MODE, _release_ram, free_all_except, register_free_fn
 
 # ── Lazy singleton ──────────────────────────────────────────────────────────
 _FLUX_FILL_PIPE = None
@@ -59,64 +58,10 @@ def _get_flux_fill_pipe():
                 pass
             free_mib = torch.cuda.mem_get_info()[0] / 1024 ** 2
             print(f"  [Flux-Fill] Pre-load free VRAM: {free_mib:.0f} MiB")
-        kwargs: dict = {"torch_dtype": torch.bfloat16}
-        # low_cpu_mem_usage streams sharded weights at load time instead of
-        # constructing the full bf16 tensors in CPU RAM first → avoids the
-        # ~24 GB load-time RAM peak that triggered systemd-oomd on this
-        # 14 GB box.
-        if bool(getattr(config, "FLUX_FILL_LOW_CPU_MEM_USAGE", False)):
-            kwargs["low_cpu_mem_usage"] = True
-        pipe = FluxFillPipeline.from_pretrained(model_id, **kwargs)
-        # Pick offload mode based on config (priority order):
-        #   mmgp       → "GPU Poor" memory manager: smarter lifecycle + adaptive
-        #                slicing + async transfers. Takes precedence when on.
-        #   group      → block_level group offload, N adjacent blocks resident
-        #                + async stream-prefetch of the next group.
-        #   sequential → leaf-level, every layer round-trips PCIe per step.
-        #                Slowest but lowest VRAM (~6 GB).
-        #   model      → whole pipeline on device during inference (~24 GB
-        #                for Flux — OOMs on 12 GB cards, only for SD-1.5).
-        #   none       → fully on device, requires 24 GB+ headroom (A100).
-        use_mmgp  = bool(getattr(config, "USE_MMGP_OFFLOAD", False))
-        use_group = bool(getattr(config, "FLUX_FILL_GROUP_OFFLOAD", False))
-        use_seq   = bool(getattr(config, "FLUX_FILL_SEQUENTIAL_OFFLOAD", False))
-        if use_mmgp:
-            try:
-                from mmgp import offload as mmgp_offload
-                profile_no   = int(getattr(config, "MMGP_PROFILE", 5))
-                pinned       = bool(getattr(config, "MMGP_PINNED_MEMORY", False))
-                mmgp_offload.profile(pipe, profile_no, pinnedMemory=pinned)
-                mode = f"mmgp(profile={profile_no}, pinned={pinned})"
-                _FLUX_FILL_PIPE = pipe
-                print(f"  [Flux-Fill] Ready (offload_mode={mode})")
-                return _FLUX_FILL_PIPE
-            except Exception as exc:                          # noqa: BLE001
-                print(f"  [Flux-Fill] mmgp setup failed: {exc!r} — falling back to sequential")
-                use_seq = True
-        if use_group:
-            n_blocks   = int(getattr(config, "FLUX_FILL_GROUP_BLOCKS", 4))
-            use_stream = bool(getattr(config, "FLUX_FILL_GROUP_USE_STREAM", False))
-            disk_path  = getattr(config, "FLUX_FILL_OFFLOAD_DISK_PATH", None)
-            go_kwargs: dict = {
-                "onload_device":        torch.device(DEVICE),
-                "offload_device":       torch.device("cpu"),
-                "offload_type":         "block_level",
-                "num_blocks_per_group": n_blocks,
-                "use_stream":           use_stream,
-                "record_stream":        use_stream,
-            }
-            if disk_path:
-                Path(disk_path).mkdir(parents=True, exist_ok=True)
-                go_kwargs["offload_to_disk_path"] = disk_path
-            pipe.enable_group_offload(**go_kwargs)
-            mode = (f"group_offload(blocks={n_blocks}, stream={use_stream}"
-                    f"{', disk=' + disk_path if disk_path else ''})")
-        elif use_seq:
+        pipe = FluxFillPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+        if bool(getattr(config, "FLUX_FILL_SEQUENTIAL_OFFLOAD", False)):
             pipe.enable_sequential_cpu_offload()
             mode = "sequential_cpu_offload"
-        elif getattr(config, "FLUX_FILL_CPU_OFFLOAD", True):
-            pipe.enable_model_cpu_offload()
-            mode = "model_cpu_offload"
         else:
             pipe = pipe.to(DEVICE)
             mode = "fully_on_device"
@@ -145,6 +90,9 @@ def _get_flux_fill_pipe():
 
 
 def _free_flux_fill():
+    """Unload Flux from GPU. No-op in SERVER_MODE — stays resident."""
+    if SERVER_MODE:
+        return
     global _FLUX_FILL_PIPE
     if _FLUX_FILL_PIPE is not None:
         try:

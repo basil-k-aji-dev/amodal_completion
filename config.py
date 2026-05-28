@@ -1,5 +1,5 @@
 # ── Input ─────────────────────────────────────────────────────────────────────
-IMAGE_PATH = "/home/basil-k-aji/Desktop/Workspace/RD/website/bear-8845470_640_bear.jpg"
+IMAGE_PATH = "/root/workspace/amodal_completion/docs/examples/bear/input.jpg"
 
 # Optional: the occluded object to reveal.
 # Leave empty ("") to let the model automatically detect what is occluded.
@@ -47,61 +47,34 @@ CLIP_VERIFY_PROMPT_TEMPLATE = "a photo of a {target}"
 # produce usable segments. When False, mask-review verifies but issues no clicks.
 USE_GPT_CLICK            = True
 
-# ── GPU memory cap ────────────────────────────────────────────────────────────
-# Hard limit on VRAM usage per process. Set to None to disable.
-GPU_MEMORY_LIMIT_GB = 10.0
+# ── GPU offload mode ──────────────────────────────────────────────────────────
+# True  → sequential CPU offload for Flux (for small GPUs, <14 GB).
+#         Applies GPU memory cap, frees models between steps.
+# False → everything lives on GPU; no cap, no free/reload between steps.
+#         Use this on large-VRAM cards (L40S, A100, etc.).
+SEQUENTIAL_OFFLOAD = False
 
 # ── Inpainter backend selector ────────────────────────────────────────────────
 # "flux_fill"   — local FLUX.1-Fill-dev (strong anatomy/texture priors).
-# "remote_flux" — call a remote Flux server (server.py /inpaint); only the Flux
-#                 denoise is offloaded, the rest of the pipeline runs locally.
+# "remote_flux" — call a remote Flux server (server.py /inpaint).
 INPAINT_BACKEND     = "flux_fill"
 REMOTE_FLUX_URL     = ""
-REMOTE_FLUX_TIMEOUT = 900                  # seconds; cover 3 off-frame iters + warmup
+REMOTE_FLUX_TIMEOUT = 900
 
 # ── Full-pipeline remote dispatch (client.py) ─────────────────────────────────
-# RUN_ENV selects where the pipeline runs:
-#   "local"     — everything runs locally (pipeline.graph.run).
-#   "lightning" — uploads the image to LIGHTNING_URL (server.py on a Lightning
-#                 Studio) and downloads the ZIP.
-#   "colab"     — uploads to COLAB_URL (the same server.py running in a Colab
-#                 notebook, exposed via ngrok / cloudflared). Server code is
-#                 identical; only the tunnel URL differs.
-#
-# Legacy USE_LIGHTNING is still honoured: if RUN_ENV is unset and USE_LIGHTNING
-# is True, the client behaves as if RUN_ENV="lightning".
-RUN_ENV           = "local"          # "local" | "lightning" | "colab"
-USE_LIGHTNING     = False            # deprecated; prefer RUN_ENV
+# "local" | "lightning" | "colab"
+RUN_ENV           = "local"
+USE_LIGHTNING     = False
 LIGHTNING_URL     = ""
-LIGHTNING_TIMEOUT = 1800             # seconds; whole-pipeline upper bound
-COLAB_URL         = ""               # e.g. "https://xxxx-xx-xx.ngrok-free.app"
-COLAB_TIMEOUT     = 1800             # seconds; whole-pipeline upper bound
+LIGHTNING_TIMEOUT = 1800
+COLAB_URL         = ""
+COLAB_TIMEOUT     = 1800
 
-# ── Flux-Fill config (used when INPAINT_BACKEND in {flux_fill, remote_flux}) ──
+# ── Flux-Fill config ──────────────────────────────────────────────────────────
 FLUX_FILL_MODEL_ID         = "black-forest-labs/FLUX.1-Fill-dev"
 FLUX_FILL_STEPS            = 50
-FLUX_FILL_GUIDANCE_SCALE   = 45.0    # Flux uses high CFG (10-50); higher = sharper detail
+FLUX_FILL_GUIDANCE_SCALE   = 45.0
 FLUX_FILL_MAX_SEQUENCE_LEN = 512
-# When AUTO_DETECT_OFFLOAD=True, runtime.py overrides the FLUX_FILL_*_OFFLOAD
-# flags + GPU_MEMORY_LIMIT_GB based on detected VRAM at startup. Lets the same
-# code run on a 12 GB local card or a 22 GB L4 without manual changes.
-AUTO_DETECT_OFFLOAD          = False  # manual: set FLUX_FILL_*_OFFLOAD below
-FLUX_FILL_CPU_OFFLOAD        = True   # enable_model_cpu_offload — ~10 GB peak
-FLUX_FILL_SEQUENTIAL_OFFLOAD = True   # enable_sequential_cpu_offload — ~6 GB peak (3-4× slower)
-                                      # Takes precedence over FLUX_FILL_CPU_OFFLOAD when True.
-# Disk-offload + low-cpu-mem experiment (disabled; code paths kept in flux.py).
-FLUX_FILL_GROUP_OFFLOAD     = False
-FLUX_FILL_GROUP_BLOCKS      = 2
-FLUX_FILL_GROUP_USE_STREAM  = False
-FLUX_FILL_OFFLOAD_DISK_PATH = "/tmp/flux_fill_offload"
-FLUX_FILL_LOW_CPU_MEM_USAGE = False
-
-# ── mmgp offload (alternative to diffusers sequential offload) ─────────────────
-# https://github.com/deepbeepmeep/mmgp — takes precedence over the FLUX_FILL_*
-# offload flags when USE_MMGP_OFFLOAD=True.
-USE_MMGP_OFFLOAD   = False
-MMGP_PROFILE       = 5
-MMGP_PINNED_MEMORY = False
 
 # ── Off-frame extension + auto-budget padding ─────────────────────────────────
 # FORCE_FRAME_CROPPED=True forces the off-frame extension path on every image.
@@ -121,6 +94,11 @@ MIN_EXTENSION_PX              = 100
 
 # ── Mask dilation ─────────────────────────────────────────────────────────────
 MASK_EXPAND = 20    # px for elliptical dilation of the occluder mask
+
+# ── Agent toggles ─────────────────────────────────────────────────────────────
+USE_OCCLUSION_AGENT  = True   # Agent 1: SAM3 + GPT occlusion analysis
+USE_COMPLETION_AGENT = True   # Agent 2: Flux inpainting + off-frame extension
+USE_REVIEWER         = False  # Agent 3: GPT-V quality review + retry loop
 
 # ── Agent settings ────────────────────────────────────────────────────────────
 SCORE_THRESHOLD  = 7.0   # reviewer score >= this = accepted

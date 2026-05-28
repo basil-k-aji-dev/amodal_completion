@@ -17,7 +17,7 @@ import torch
 from PIL import Image
 
 import config
-from runtime import DEVICE, _release_ram, register_free_fn
+from runtime import DEVICE, SERVER_MODE, _release_ram, register_free_fn
 
 # ── Lazy singletons ─────────────────────────────────────────────────────────
 _SAM3_PIPE           = None
@@ -45,7 +45,10 @@ def _get_sam3():
 
 
 def _free_sam3():
-    """Move every SAM3 pipeline component off GPU then clear cache."""
+    """Move every SAM3 pipeline component off GPU then clear cache.
+    No-op in SERVER_MODE — model stays resident for the next request."""
+    if SERVER_MODE:
+        return
     global _SAM3_PIPE, _SAM3_TEXT_MODEL, _SAM3_TEXT_PROCESSOR
     if _SAM3_PIPE is None and _SAM3_TEXT_MODEL is None and _SAM3_TEXT_PROCESSOR is None:
         return

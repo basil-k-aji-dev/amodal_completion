@@ -50,42 +50,30 @@ API_KEY   = os.environ.get("OPENAI_API_KEY")
 GPT_MODEL = os.environ.get("OPENAI_MODEL")
 DEVICE    = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── Auto-detect Flux offload mode + GPU cap from VRAM ─────────────────
-# Picks the right strategy regardless of whether we're on a 12 GB RTX 3060, a
-# 22 GB L4, an A100, etc. Set config.AUTO_DETECT_OFFLOAD = False to keep the
-# manual FLUX_FILL_*_OFFLOAD values from config.py.
+# ── GPU setup ─────────────────────────────────────────────────────────────────
 if DEVICE == "cuda":
     _total_gb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-    if bool(getattr(config, "AUTO_DETECT_OFFLOAD", True)):
-        #   <14 GB  → stream layer-by-layer (sequential_cpu_offload)
-        #   14–38 GB → swap component-by-component (model_cpu_offload)
-        #   ≥38 GB  → keep everything resident (no offload, fastest)
-        if _total_gb < 14.0:
-            mode = "sequential"
-            config.FLUX_FILL_SEQUENTIAL_OFFLOAD = True
-            config.FLUX_FILL_CPU_OFFLOAD = True
-            cap = max(_total_gb - 2.0, 6.0)
-        elif _total_gb < 38.0:
-            mode = "model_offload"
-            config.FLUX_FILL_SEQUENTIAL_OFFLOAD = False
-            config.FLUX_FILL_CPU_OFFLOAD = True
-            cap = max(_total_gb - 2.0, 12.0)
-        else:
-            mode = "fully_on_device"
-            config.FLUX_FILL_SEQUENTIAL_OFFLOAD = False
-            config.FLUX_FILL_CPU_OFFLOAD = False
-            cap = _total_gb - 4.0
-        config.GPU_MEMORY_LIMIT_GB = cap
-        print(f"GPU      : {torch.cuda.get_device_name(0)}  ({_total_gb:.1f} GB)")
-        print(f"Auto-cfg : flux_offload={mode}  gpu_cap={cap:.1f} GB")
+    _seq = bool(getattr(config, "SEQUENTIAL_OFFLOAD", False))
 
-    if config.GPU_MEMORY_LIMIT_GB:
-        _fraction = min(config.GPU_MEMORY_LIMIT_GB / _total_gb, 1.0)
+    if _seq:
+        # Small GPU: cap VRAM, enable sequential offload flags for flux.py
+        _cap = max(_total_gb - 2.0, 6.0)
+        config.FLUX_FILL_SEQUENTIAL_OFFLOAD = True
+        config.FLUX_FILL_CPU_OFFLOAD        = True
+        config.GPU_MEMORY_LIMIT_GB          = _cap
+        _fraction = min(_cap / _total_gb, 1.0)
         torch.cuda.set_per_process_memory_fraction(_fraction, device=0)
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        print(f"GPU cap  : {config.GPU_MEMORY_LIMIT_GB:.1f} GB / {_total_gb:.1f} GB  ({_fraction:.0%})")
+        print(f"GPU      : {torch.cuda.get_device_name(0)}  ({_total_gb:.1f} GB)  "
+              f"[sequential offload, cap={_cap:.1f} GB]")
+    else:
+        # Large GPU: no cap, no offload, all models resident
+        config.FLUX_FILL_SEQUENTIAL_OFFLOAD = False
+        config.FLUX_FILL_CPU_OFFLOAD        = False
+        config.GPU_MEMORY_LIMIT_GB          = None
+        print(f"GPU      : {torch.cuda.get_device_name(0)}  ({_total_gb:.1f} GB)  "
+              f"[fully on device]")
 
-    # Free Ampere perf wins — mathematically benign on bf16/fp32 inference.
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -105,6 +93,12 @@ def _release_ram() -> None:
 # Each model module registers its free() at import time via register_free_fn.
 # free_all_except() then frees every loaded model except the named keepers,
 # without runtime needing to import any model module.
+#
+# SERVER_MODE: when True (set by server.py at startup), all model free/unload
+# calls become no-ops. On a large-VRAM GPU (L40S, A100) all models fit resident
+# simultaneously — freeing and reloading between pipeline steps only wastes time.
+SERVER_MODE: bool = False
+
 _FREE_FNS: "dict[str, Callable[[], None]]" = {}
 
 
@@ -114,8 +108,9 @@ def register_free_fn(name: str, fn: "Callable[[], None]") -> None:
 
 def free_all_except(*keep_names: str) -> None:
     """Free every registered GPU-resident model EXCEPT those named in
-    `keep_names` (e.g. 'sam3', 'flux', 'clip'). Hard barrier before loading a
-    heavy model so it can grab peak allocation without fragmentation."""
+    `keep_names`. No-op in SERVER_MODE — all models stay resident."""
+    if SERVER_MODE:
+        return
     keep = set(keep_names)
     for name, fn in list(_FREE_FNS.items()):
         if name in keep:

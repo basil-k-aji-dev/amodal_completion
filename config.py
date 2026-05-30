@@ -1,9 +1,9 @@
 # ── Input ─────────────────────────────────────────────────────────────────────
-IMAGE_PATH = "/root/workspace/amodal_completion/docs/examples/bear/input.jpg"
+IMAGE_PATH = "/home/basil-k-aji/Desktop/Workspace/RD/TEST/amodal_test3/test_inputs_bear_horse/african-american-7481724_640_horse.jpg"
 
 # Optional: the occluded object to reveal.
 # Leave empty ("") to let the model automatically detect what is occluded.
-TARGET = "bear"
+TARGET = "horse"
 
 # ── GPT (loaded from .env: OPENAI_MODEL, OPENAI_API_KEY) ─────────────────────
 GPT_MAX_TOKENS = 10192
@@ -52,7 +52,10 @@ USE_GPT_CLICK            = True
 #         Applies GPU memory cap, frees models between steps.
 # False → everything lives on GPU; no cap, no free/reload between steps.
 #         Use this on large-VRAM cards (L40S, A100, etc.).
-SEQUENTIAL_OFFLOAD = False
+SEQUENTIAL_OFFLOAD = True
+# Set by runtime.py — True on ≥12 GB cards (model-level offload, ~10 GB peak, faster).
+# False falls back to layer-by-layer sequential offload (~6 GB peak, slower).
+FLUX_FILL_MODEL_CPU_OFFLOAD = False
 
 # ── Inpainter backend selector ────────────────────────────────────────────────
 # "flux_fill"   — local FLUX.1-Fill-dev (strong anatomy/texture priors).
@@ -73,24 +76,9 @@ COLAB_TIMEOUT     = 1800
 # ── Flux-Fill config ──────────────────────────────────────────────────────────
 FLUX_FILL_MODEL_ID         = "black-forest-labs/FLUX.1-Fill-dev"
 FLUX_FILL_STEPS            = 50
-FLUX_FILL_GUIDANCE_SCALE   = 45.0
+FLUX_FILL_GUIDANCE_SCALE   = 30.0
 FLUX_FILL_MAX_SEQUENCE_LEN = 512
 
-# ── Off-frame extension + auto-budget padding ─────────────────────────────────
-# FORCE_FRAME_CROPPED=True forces the off-frame extension path on every image.
-FORCE_FRAME_CROPPED    = False
-FORCE_EXPANSION_PIXELS = {"top": 0, "bottom": 280, "left": 80, "right": 300}  # legacy fixed-padding
-# USE_AUTO_PADDING_BUDGET pads each side by FORCE_FRAME_CROPPED_BUDGET_PX, capped
-# so neither dim exceeds MAX_PADDED_CANVAS_DIM, then crops to the subject bbox
-# + AUTO_CROP_MARGIN_PX after Flux + SAM3.
-USE_AUTO_PADDING_BUDGET       = True
-FORCE_FRAME_CROPPED_BUDGET_PX = 400   # preferred padding per side (px)
-MAX_PADDED_CANVAS_DIM         = 1280  # cap on each padded dim (Flux VRAM-bounded)
-AUTO_CROP_MARGIN_PX           = 30    # margin around segmented subject when cropping
-# Narrow the Flux inpaint mask to (gray padding) ∩ (visible_bbox × multiplier).
-USE_EXTENSION_BBOX            = False
-EXTENSION_MULTIPLIER          = 2.0
-MIN_EXTENSION_PX              = 100
 
 # ── Mask dilation ─────────────────────────────────────────────────────────────
 MASK_EXPAND = 20    # px for elliptical dilation of the occluder mask

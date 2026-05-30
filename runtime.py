@@ -56,16 +56,23 @@ if DEVICE == "cuda":
     _seq = bool(getattr(config, "SEQUENTIAL_OFFLOAD", False))
 
     if _seq:
-        # Small GPU: cap VRAM, enable sequential offload flags for flux.py
+        # Only truly large cards (≥40 GB, e.g. A100/H100) use model-level offload.
+        # model_cpu_offload loads the full Flux transformer (~24 GB) into system RAM which
+        # OOMs on machines with ≤16 GB RAM. sequential_cpu_offload (~6 GB peak) is safe.
+        _use_model_offload = _total_gb >= 40.0
         _cap = max(_total_gb - 2.0, 6.0)
-        config.FLUX_FILL_SEQUENTIAL_OFFLOAD = True
-        config.FLUX_FILL_CPU_OFFLOAD        = True
-        config.GPU_MEMORY_LIMIT_GB          = _cap
-        _fraction = min(_cap / _total_gb, 1.0)
-        torch.cuda.set_per_process_memory_fraction(_fraction, device=0)
+        config.FLUX_FILL_SEQUENTIAL_OFFLOAD  = True
+        config.FLUX_FILL_MODEL_CPU_OFFLOAD   = _use_model_offload
+        config.FLUX_FILL_CPU_OFFLOAD         = True
+        config.GPU_MEMORY_LIMIT_GB           = _cap
+        # Only hard-cap VRAM for cards that need layer-by-layer offload.
+        if not _use_model_offload:
+            _fraction = min(_cap / _total_gb, 1.0)
+            torch.cuda.set_per_process_memory_fraction(_fraction, device=0)
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        _offload_label = "model_cpu_offload" if _use_model_offload else f"sequential_offload, cap={_cap:.1f} GB"
         print(f"GPU      : {torch.cuda.get_device_name(0)}  ({_total_gb:.1f} GB)  "
-              f"[sequential offload, cap={_cap:.1f} GB]")
+              f"[{_offload_label}]")
     else:
         # Large GPU: no cap, no offload, all models resident
         config.FLUX_FILL_SEQUENTIAL_OFFLOAD = False

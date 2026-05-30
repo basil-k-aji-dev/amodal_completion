@@ -60,8 +60,12 @@ def _get_flux_fill_pipe():
             print(f"  [Flux-Fill] Pre-load free VRAM: {free_mib:.0f} MiB")
         pipe = FluxFillPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
         if bool(getattr(config, "FLUX_FILL_SEQUENTIAL_OFFLOAD", False)):
-            pipe.enable_sequential_cpu_offload()
-            mode = "sequential_cpu_offload"
+            if bool(getattr(config, "FLUX_FILL_MODEL_CPU_OFFLOAD", False)):
+                pipe.enable_model_cpu_offload()
+                mode = "model_cpu_offload"
+            else:
+                pipe.enable_sequential_cpu_offload()
+                mode = "sequential_cpu_offload"
         else:
             pipe = pipe.to(DEVICE)
             mode = "fully_on_device"

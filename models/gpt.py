@@ -35,7 +35,7 @@ def _encode(path) -> dict:
     return {
         "type": "input_image",
         "image_url": f"data:image/{mime};base64,{b64}",
-        "detail": "high",
+        "detail": "original",
     }
 
 
@@ -53,9 +53,9 @@ def gpt_vision(images: list, prompt: str, schema: dict = None,
                 "name":   schema["name"],
                 "schema": schema["schema"],
                 "strict": schema.get("strict", True),
-            }}
+            }, "verbosity": "high"}
         else:
-            text_cfg = {"format": {"type": "json_object"}}
+            text_cfg = {"format": {"type": "json_object"}, "verbosity": "high"}
 
         kwargs: dict = {
             "model":     GPT_MODEL,

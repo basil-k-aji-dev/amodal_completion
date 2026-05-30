@@ -617,241 +617,6 @@ DEFAULT TO 'redraw' when ANY of:
 
 
 
-def _flux_extend_amodal_mask_offframe(
-    image_bgr: np.ndarray,
-    in_frame_amodal_mask: np.ndarray,
-    expansion_pixels: dict,
-    subject_text: str,
-    out_dir: Path,
-    pad_color: int = 128,
-) -> tuple:
-    """Build a padded canvas, outpaint the off-frame margins with Flux-Fill
-    so the subject's anatomy continues into them, then run SAM3 with a
-    click on the in-frame subject centroid to segment the FULL silhouette
-    (in-frame + outpainted) on the padded canvas.
-
-    Returns (padded_full_mask, offframe_only_mask, padded_image, offsets).
-      padded_full_mask   — H'×W' uint8 binary of the full subject
-                           silhouette on the padded canvas (in-frame +
-                           Flux-generated off-frame).
-      offframe_only_mask — H'×W' uint8 binary of ONLY the off-frame portion
-                           (= padded_full_mask zeroed inside the original
-                           image rectangle).
-      padded_image       — H'×W'×3 uint8 BGR of the OUTPAINTED padded canvas
-                           (original in place + Flux-generated content in
-                           the margins).
-      offsets            — dict with {"top", "bottom", "left", "right",
-                           "orig_h", "orig_w"} so the caller can map back to
-                           original coordinates.
-
-    Returns (None, None, None, None) on failure.
-    """
-    h, w = image_bgr.shape[:2]
-    pad_t = max(0, int(expansion_pixels.get("top",    0)))
-    pad_b = max(0, int(expansion_pixels.get("bottom", 0)))
-    pad_l = max(0, int(expansion_pixels.get("left",   0)))
-    pad_r = max(0, int(expansion_pixels.get("right",  0)))
-    if pad_t + pad_b + pad_l + pad_r == 0:
-        return None, None, None, None
-
-    H, W = h + pad_t + pad_b, w + pad_l + pad_r
-
-    # ── 1. Build the padded canvas (original in place, gray margins) ─────
-    padded_bgr = np.full((H, W, 3), pad_color, dtype=np.uint8)
-    padded_bgr[pad_t:pad_t + h, pad_l:pad_l + w] = image_bgr
-
-    # ── 2. Padded in-frame amodal mask (same placement, just for viz) ────
-    padded_in_mask = np.zeros((H, W), dtype=np.uint8)
-    padded_in_mask[pad_t:pad_t + h, pad_l:pad_l + w] = (in_frame_amodal_mask > 0).astype(np.uint8)
-
-    # ── 3. Build the inpaint mask = the off-frame margin region only ─────
-    outpaint_mask = np.ones((H, W), dtype=np.uint8)
-    outpaint_mask[pad_t:pad_t + h, pad_l:pad_l + w] = 0   # 0 = keep, 1 = inpaint
-
-    # ── 3b. Narrow the inpaint mask to a dilated visible-bbox region ──────
-    # Restricts Flux to only the gray padding near the subject. Outside the
-    # extension bbox stays gray (Flux skips it), saving 2-4× Flux runtime
-    # since those pixels would be cropped away by step 7 anyway.
-    if getattr(config, "USE_EXTENSION_BBOX", False):
-        ys, xs = np.where(padded_in_mask > 0)
-        if len(ys) >= 16:
-            vx1, vy1 = int(xs.min()), int(ys.min())
-            vx2, vy2 = int(xs.max()), int(ys.max())
-            vw, vh = vx2 - vx1 + 1, vy2 - vy1 + 1
-            mult = float(getattr(config, "EXTENSION_MULTIPLIER", 2.0))
-            min_ext = int(getattr(config, "MIN_EXTENSION_PX", 100))
-            ext_w = max(int((vw * (mult - 1.0)) / 2), min_ext)
-            ext_h = max(int((vh * (mult - 1.0)) / 2), min_ext)
-            bx1 = max(0, vx1 - ext_w)
-            by1 = max(0, vy1 - ext_h)
-            bx2 = min(W, vx2 + ext_w + 1)
-            by2 = min(H, vy2 + ext_h + 1)
-            bbox_mask = np.zeros((H, W), dtype=np.uint8)
-            bbox_mask[by1:by2, bx1:bx2] = 1
-            before = int(outpaint_mask.sum())
-            outpaint_mask = (outpaint_mask & bbox_mask).astype(np.uint8)
-            after = int(outpaint_mask.sum())
-            print(f"  [Amodal/offframe] narrowing mask to ext_bbox "
-                  f"[{bx1}-{bx2} × {by1}-{by2}] (mult={mult}, ext=+{ext_w}×{ext_h}) "
-                  f"→ {before} → {after} px ({100*after/max(before,1):.1f}% of full padding)")
-            cv2.imwrite(str(out_dir / "amodal_offframe_ext_bbox_viz.png"),
-                        (bbox_mask * 80 + outpaint_mask * 175).astype(np.uint8))
-
-    # Save the input viz before generation so we can debug if Flux/SAM3 fails.
-    cv2.imwrite(str(out_dir / "amodal_offframe_padded_input.png"), padded_bgr)
-    cv2.imwrite(str(out_dir / "amodal_offframe_outpaint_mask.png"), outpaint_mask * 255)
-
-    # ── 4. Run Flux-Fill on the padded canvas ────────────────────────────
-    # Convert to RGB for Flux/diffusers; result is RGB too.
-    padded_rgb_in = cv2.cvtColor(padded_bgr, cv2.COLOR_BGR2RGB)
-    prompt = (
-        f"Photorealistic complete {subject_text}, full anatomy visible "
-        f"(legs, paws, tail, body), natural pose continuing from the "
-        f"visible portion. EXTREMELY SHARP focus, crisp high-detail "
-        f"textures (fur strands, individual claws, log bark grain), "
-        f"matching exposure, lighting direction, shadows, and colour "
-        f"temperature with the surrounding scene. Seamless continuation; "
-        f"no seams, no duplicate body parts. 8K detail, DSLR photograph."
-    )
-    neg_extra = ("duplicate limbs, extra heads, second animal, frame, "
-                 "border, blurry, soft, low-detail, painting, illustration, "
-                 "smooth plastic, oversmoothed, low quality, distorted anatomy")
-
-    try:
-        flux_results = _run_flux_fill_inpaint(
-            base_np=padded_rgb_in,
-            inpaint_mask=outpaint_mask,
-            amodal_rgb_256=np.full((256, 256, 3), 255, dtype=np.uint8),
-            prompt=prompt,
-            n_samples=1,
-            out_dir=out_dir,
-            prefix="flux_offframe",
-            neg_extra=neg_extra,
-            seed_offset=0,
-        )
-    except Exception as exc:                                  # noqa: BLE001
-        print(f"  [Amodal/offframe] Flux-Fill outpaint failed: {exc!r}")
-        flux_results = []
-
-    if not flux_results:
-        print("  [Amodal/offframe] no Flux output — falling back to "
-              "in-frame amodal mask placed on gray-padded canvas")
-        padded_full   = padded_in_mask.copy()
-        offframe_only = np.zeros_like(padded_full)
-        offsets = {"top": pad_t, "bottom": pad_b, "left": pad_l, "right": pad_r,
-                   "orig_h": h, "orig_w": w}
-        return padded_full, offframe_only, padded_bgr, offsets
-
-    # Flux returns a PIL image; convert and save the canonical outpainted canvas.
-    flux_pil = flux_results[0]
-    padded_rgb_out = np.array(flux_pil.convert("RGB"))
-    if padded_rgb_out.shape[:2] != (H, W):
-        padded_rgb_out = cv2.resize(padded_rgb_out, (W, H),
-                                    interpolation=cv2.INTER_LANCZOS4)
-    padded_bgr_out = cv2.cvtColor(padded_rgb_out, cv2.COLOR_RGB2BGR)
-    # Hard-restore the original image inside the yellow rectangle (Flux can
-    # subtly modify unmasked regions due to VAE round-trip).
-    padded_bgr_out[pad_t:pad_t + h, pad_l:pad_l + w] = image_bgr
-    cv2.imwrite(str(out_dir / "amodal_offframe_outpainted.png"), padded_bgr_out)
-
-    # ── 5. Segment the FULL subject on the outpainted padded canvas ──────
-    # Click prompt = centroid of the in-frame amodal mask, translated to
-    # padded coordinates.  We also add the click coords of each non-empty
-    # margin so SAM3 can also extend if the centroid alone misses.
-    M = cv2.moments((in_frame_amodal_mask > 0).astype(np.uint8))
-    if M["m00"] > 0:
-        cx = int(M["m10"] / M["m00"]) + pad_l
-        cy = int(M["m01"] / M["m00"]) + pad_t
-    else:
-        cx, cy = pad_l + w // 2, pad_t + h // 2
-
-    # Write the padded outpainted canvas to a temp PNG so _sam_segment_targeted
-    # can re-read it (its API takes a path).
-    flux_canvas_path = out_dir / "amodal_offframe_outpainted.png"
-    sam_results = _sam_segment_targeted(
-        str(flux_canvas_path),
-        [{"label": "subject_padded", "x": cx, "y": cy}],
-        out_dir,
-    )
-
-    padded_full = padded_in_mask.copy()
-    if sam_results:
-        sam_mask = sam_results[0]["mask"]
-        if sam_mask.shape[:2] != (H, W):
-            sam_mask = cv2.resize(sam_mask.astype(np.uint8), (W, H),
-                                  interpolation=cv2.INTER_NEAREST)
-        # Sanity check: SAM3 mask should overlap the in-frame amodal heavily.
-        ovl = int(((sam_mask > 0) & (padded_in_mask > 0)).sum())
-        ovl_ratio = ovl / max(int(padded_in_mask.sum()), 1)
-        if ovl_ratio < 0.40:
-            print(f"  [Amodal/offframe] SAM3 mask only covers {ovl_ratio:.2f} "
-                  f"of in-frame amodal — rejecting, keeping in-frame mask")
-        else:
-            padded_full = np.clip((sam_mask > 0).astype(np.uint8) | padded_in_mask,
-                                  0, 1).astype(np.uint8)
-            print(f"  [Amodal/offframe] SAM3 segmented {int((sam_mask > 0).sum())} px "
-                  f"on padded canvas (in-frame was {int(padded_in_mask.sum())} px) "
-                  f"→ padded_full = {int(padded_full.sum())} px")
-    else:
-        print("  [Amodal/offframe] SAM3 returned no mask — keeping in-frame mask")
-
-    # ── 6. Save off-frame-only mask + viz ────────────────────────────────
-    offframe_only = padded_full.copy()
-    offframe_only[pad_t:pad_t + h, pad_l:pad_l + w] = 0
-
-    viz_out = padded_bgr_out.copy()
-    ov = np.zeros_like(viz_out)
-    ov[padded_full > 0]    = (255, 0, 255)   # magenta = full silhouette
-    ov[padded_in_mask > 0] = (0, 255, 0)     # green   = in-frame portion
-    viz_out = cv2.addWeighted(viz_out, 0.45, ov, 0.55, 0)
-    cv2.rectangle(viz_out, (pad_l, pad_t), (pad_l + w - 1, pad_t + h - 1),
-                  (0, 255, 255), 2)         # yellow = orig bounds
-    cv2.circle(viz_out, (cx, cy), 6, (0, 255, 255), -1)  # click point
-    cv2.imwrite(str(out_dir / "amodal_offframe_viz.png"), viz_out)
-
-    offsets = {"top": pad_t, "bottom": pad_b, "left": pad_l, "right": pad_r,
-               "orig_h": h, "orig_w": w}
-
-    # ── 7. Post-hoc crop to subject's tight bbox + margin ────────────────
-    # The padded canvas is intentionally oversized (auto-budget). After
-    # segmentation we crop everything to the subject's tight bbox + a small
-    # margin so downstream consumers get exactly the canvas they need.
-    margin = int(getattr(config, "AUTO_CROP_MARGIN_PX", 30))
-    ys, xs = np.where(padded_full > 0)
-    if len(ys) >= 16:
-        bx1 = max(0, int(xs.min()) - margin)
-        by1 = max(0, int(ys.min()) - margin)
-        bx2 = min(W, int(xs.max()) + margin + 1)
-        by2 = min(H, int(ys.max()) + margin + 1)
-        tight_w = bx2 - bx1
-        tight_h = by2 - by1
-        tight_canvas = padded_bgr_out[by1:by2, bx1:bx2].copy()
-        tight_mask   = padded_full   [by1:by2, bx1:bx2].copy()
-        tight_in_mask = padded_in_mask[by1:by2, bx1:bx2].copy()
-        tight_offframe = offframe_only[by1:by2, bx1:bx2].copy()
-        cv2.imwrite(str(out_dir / "subject_tight_canvas.png"),   tight_canvas)
-        cv2.imwrite(str(out_dir / "subject_tight_mask.png"),     tight_mask * 255)
-        cv2.imwrite(str(out_dir / "subject_tight_in_mask.png"),  tight_in_mask * 255)
-        cv2.imwrite(str(out_dir / "subject_tight_offframe.png"), tight_offframe * 255)
-        # Transparent RGBA cutout where alpha = subject mask
-        rgba_tight = np.zeros((tight_h, tight_w, 4), dtype=np.uint8)
-        rgba_tight[..., :3] = tight_canvas
-        rgba_tight[..., 3]  = (tight_mask > 0).astype(np.uint8) * 255
-        cv2.imwrite(str(out_dir / "subject_tight_rgba.png"), rgba_tight)
-        # Offsets relative to the padded canvas + back to original image:
-        offsets["tight_bbox_in_padded"] = [bx1, by1, bx2, by2]
-        offsets["tight_w"] = tight_w
-        offsets["tight_h"] = tight_h
-        # Original image coords relative to tight canvas: (pad_l - bx1, pad_t - by1)
-        offsets["orig_in_tight"] = [pad_l - bx1, pad_t - by1,
-                                    pad_l - bx1 + w, pad_t - by1 + h]
-        print(f"  [Amodal/offframe] cropped to subject bbox "
-              f"[{bx1}-{bx2} × {by1}-{by2}] → {tight_w}×{tight_h} "
-              f"(was {W}×{H}) → subject_tight_*.png")
-    else:
-        print(f"  [Amodal/offframe] post-crop skipped (mask too small)")
-
-    return padded_full, offframe_only, padded_bgr_out, offsets
 
 
 
@@ -1243,8 +1008,7 @@ For EACH of the four image edges, check:
 For each edge where the subject exits, note the specific body part and approximate
 percentage of the expected full body that is missing there.
 
-Only include an edge in `expansion_directions` if the subject MEANINGFULLY exits there
-(≥8% of the full body missing on that side).
+Set `frame_cropped=true` only when a MEANINGFUL portion (≥8% of expected full body) exits an edge.
 
 ══════════════════════════════════════════════════════════════════════
 STEP 4 — FILL ALL FIELDS
@@ -1329,8 +1093,6 @@ For MODE A (frame_cropped = false):
     Leave [] ONLY if `visible_segment_ids` already provides a good mask.
   • `hidden_region`: tight bounding box around the physically hidden (occluded) area.
   • `boundary_expansion`: dilation in pixels (15–40) for smooth blending at mask edges.
-  • `expansion_directions`: [] — no canvas expansion needed.
-  • `expansion_pixels`: {{"top":0,"bottom":0,"left":0,"right":0}}
   • `hidden_polygon`: precise polygon tracing the HIDDEN BODY SILHOUETTE — the
     shape of the SUBJECT's anatomy in the region behind the occluder.
     ⚠ ABSOLUTE RULE: this polygon traces the SUBJECT, NOT the OCCLUDER.
@@ -1383,12 +1145,13 @@ For MODE A (frame_cropped = false):
     Used as a SAM3 point prompt to cleanly isolate the occluder.
   • `subject_click`: pixel (x, y) at the CENTER of the visible subject.
     Used as a SAM3 point prompt to cleanly isolate the subject from the occluder.
+  • `secondary_occluders`: [] (leave empty for MODE A — there is only one primary occluder).
 
 For MODE B (frame_cropped = true):
   • `occluded_object`: subject being cut off (e.g. "Silver Gull", "person", "German Shepherd")
   • `occluder`: "image frame boundary"
   • `what_to_remove`: "" (nothing to remove from the scene)
-  • `selected_segment_ids`: [] (no in-scene occluder)
+  • `selected_segment_ids`: [] (no primary in-scene occluder)
   • `visible_segment_ids`: [] on the first raw-image pass. If a second image
     with numbered SAM3 auto-segments is provided, include SAM3 IDs of the ENTIRE
     VISIBLE subject body — head, body, wings, visible legs, etc.
@@ -1399,35 +1162,24 @@ For MODE B (frame_cropped = true):
   • `hidden_polygon`: polygon tracing the STRIP of canvas that needs to be generated
     (the expansion area near the frame edge). Follow the frame edge on one side and
     the subject's body boundary on the other.
-  • `occluder_click`: {{"x":0,"y":0}} (no in-scene occluder in frame-crop mode).
+  • `occluder_click`: {{"x":0,"y":0}} (no primary in-scene occluder in frame-crop mode).
   • `subject_click`: pixel (x, y) at the CENTER of the visible subject body.
-  • `expansion_directions`: list of edge names where subject exits with ≥8% body missing.
-    Valid values: "top", "bottom", "left", "right"
-  • `expansion_pixels`: pixels to ADD to canvas in each direction.
-    Use this anatomy-based estimation:
-
-    ┌─────────────────────────────────────────────────────────────┐
-    │ ANATOMY PROPORTIONS (% of full body height or width)        │
-    │                                                             │
-    │ BIRD (standing, folded wings):                              │
-    │   Head 15% · Neck 10% · Body/torso 40%                     │
-    │   Legs (tarsus+toes) 20% · Tail feathers 15%               │
-    │   If feet cut at bottom: expansion ≈ 25% × bird_height_px  │
-    │   If tail cut at bottom: expansion ≈ 15% × bird_height_px  │
-    │   If wing clipped at side: expansion ≈ 30-50% × bird_width │
-    │                                                             │
-    │ HUMAN (standing):                                           │
-    │   Head 12% · Torso 38% · Upper leg 25% · Lower leg+foot 25%│
-    │   If only torso visible: bottom ≈ 50% × visible_height     │
-    │   If waist-down missing: bottom ≈ 50% × image_height       │
-    │                                                             │
-    │ QUADRUPED (dog/cat/horse standing):                         │
-    │   Head+neck 25% · Body 40% · Legs 35%                      │
-    │   If legs cut: bottom ≈ 40% × visible_body_height          │
-    └─────────────────────────────────────────────────────────────┘
-
-    Round to nearest 50 px. Minimum 150 px per active direction.
-    Set inactive directions to 0.
+  • `secondary_occluders`: CRITICAL — even in frame-crop mode, carefully inspect
+    EVERY BODY PART of the subject for in-scene objects that are ALSO partially
+    blocking them. Look specifically at:
+      - Shoulders, arms, hands: is any object (animal, person, furniture) overlapping them?
+      - Torso/waist: is there a foreground object (railing, car door, animal body) in front?
+      - Head/face: any object partially covering it?
+    For EACH in-scene occluder found (even small ones), provide:
+      - `label`: 1–3 word class noun (e.g. "horse", "fence", "arm")
+      - `occluder_click`: pixel at the geometric center of that occluder object
+      - `segment_ids`: [] (fill on fallback pass if SAM3 overlay provided)
+    ⚠ DO NOT skip this field just because frame_cropped=True. Both frame-crop AND
+    in-scene occlusion can exist simultaneously.
+    Example: person's legs cut off (frame_cropped=True) AND a horse's neck overlaps
+    the person's right shoulder → secondary_occluders=[{{"label":"horse","occluder_click":{{"x":150,"y":120}},"segment_ids":[]}}]
+    Leave [] ONLY if you have carefully checked every body part and confirmed no
+    in-scene object overlaps any part of the subject.
 
 ══════════════════════════════════════════════════════════════════════
 FINAL CHECK BEFORE YOU RESPOND
@@ -1457,7 +1209,7 @@ Respond ONLY in JSON matching the schema."""
     data = gpt_vision(
         [state["image_path"]],
         prompt, schema=OCCLUSION_SCHEMA,
-        cache_key="occlusion_analysis_text_first_v1",
+        cache_key="occlusion_analysis_text_first_v3",
     )
 
     sel_ids      = data.get("selected_segment_ids", [])
@@ -1466,33 +1218,6 @@ Respond ONLY in JSON matching the schema."""
     region       = data.get("hidden_region", {})
     expansion    = int(data.get("boundary_expansion", config.MASK_EXPAND))
     frame_cropped = bool(data.get("frame_cropped", False))
-    exp_dirs     = data.get("expansion_directions", [])
-    exp_px       = data.get("expansion_pixels", {"top": 0, "bottom": 0, "left": 0, "right": 0})
-
-    # ── Debug override: force ONLY the off-frame extension step ──────────
-    # Keeps the rest of the pipeline (mode A vs B routing, mask fusion, Agent
-    # 2 path) intact — only the padded-canvas / off-frame mask helper fires.
-    # `force_offframe` is read further down where _gpt_extend_amodal_mask_offframe
-    # is invoked.
-    force_offframe = False
-    if getattr(config, "FORCE_FRAME_CROPPED", False):
-        force_offframe = True
-        if getattr(config, "USE_AUTO_PADDING_BUDGET", False):
-            # Auto-budget: pad each side by budget_px, capped so neither padded
-            # dim exceeds MAX_PADDED_CANVAS_DIM. Symmetric on each axis.
-            budget  = int(getattr(config, "FORCE_FRAME_CROPPED_BUDGET_PX", 400))
-            max_dim = int(getattr(config, "MAX_PADDED_CANVAS_DIM", 1280))
-            pad_w   = min(budget, max(0, (max_dim - w) // 2))
-            pad_h   = min(budget, max(0, (max_dim - h) // 2))
-            force_exp_px = {"top": pad_h, "bottom": pad_h,
-                            "left": pad_w, "right": pad_w}
-            print(f"  [FORCE] auto-budget padding (budget={budget}, max_dim={max_dim}) "
-                  f"→ {force_exp_px}  padded={w + 2*pad_w}×{h + 2*pad_h}")
-        else:
-            force_exp_px = dict(getattr(config, "FORCE_EXPANSION_PIXELS",
-                                        {"top": 0, "bottom": 120, "left": 0, "right": 0}))
-            print(f"  [FORCE] fixed-padding mode "
-                  f"px={force_exp_px}")
     bbox         = [region.get("x1", 0), region.get("y1", 0),
                     region.get("x2", w), region.get("y2", h)]
     # Fix 2: new fields
@@ -1503,10 +1228,7 @@ Respond ONLY in JSON matching the schema."""
     print(f"  Occluded object  : {data.get('occluded_object', '')}")
     print(f"  Occluder         : {data.get('occluder', '')}")
     print(f"  Frame-cropped    : {frame_cropped}")
-    if frame_cropped:
-        print(f"  Expand dirs      : {exp_dirs}")
-        print(f"  Expand pixels    : {exp_px}")
-    else:
+    if not frame_cropped:
         print(f"  Occluder seg IDs : {sel_ids}")
     print(f"  Visible seg IDs  : {vis_ids}")
     print(f"  Hidden region    : {region}")
@@ -1518,10 +1240,13 @@ Respond ONLY in JSON matching the schema."""
     if sub_click.get("x") or sub_click.get("y"):
         print(f"  Subject click    : ({sub_click['x']}, {sub_click['y']})")
 
-    target_class   = (data.get("occluded_object", "") or "").strip()
-    occluder_class = (data.get("occluder", "") or "").strip()
-    target_short   = _extract_short_label(target_class)
-    occluder_short = _extract_short_label(occluder_class)
+    target_class       = (data.get("occluded_object", "") or "").strip()
+    occluder_class     = (data.get("occluder", "") or "").strip()
+    target_short       = _extract_short_label(target_class)
+    occluder_short     = _extract_short_label(occluder_class)
+    secondary_occluders = data.get("secondary_occluders", []) or []
+    if secondary_occluders:
+        print(f"  Secondary occluders: {[o.get('label') for o in secondary_occluders]}")
 
     (out_dir / "occlusion_text_first.json").write_text(json.dumps(data, indent=2))
 
@@ -1535,6 +1260,8 @@ Respond ONLY in JSON matching the schema."""
     text_visible_mask  = np.zeros((h, w), dtype=np.uint8)
     sam3_text_occluder_good = False
     sam3_text_visible_good  = False
+    tv_score = 0.0
+    to_score = 0.0
 
     text_target_prompt = target_class or target_short or hint
     text_occluder_prompt = occluder_class or occluder_short
@@ -1572,26 +1299,89 @@ Respond ONLY in JSON matching the schema."""
     if need_auto_fallback:
         print("  [Text-first] CLIP rejected text-prompt mask(s) — running SAM3 auto-seg fallback")
         segments, sam3_viz_path = _sam_segment_all(state["image_path"], out_dir)
+
+        # ── Build click-overlay image so GPT can see where its clicks landed ──
+        clip_thresh = float(getattr(config, "CLIP_VERIFY_THRESHOLD", 0.20))
+        click_overlay = img.copy()
+        def _draw_click(canvas, click_dict, color_bgr, label):
+            cx = int((click_dict or {}).get("x", 0))
+            cy = int((click_dict or {}).get("y", 0))
+            if 0 < cx < canvas.shape[1] and 0 < cy < canvas.shape[0]:
+                cv2.circle(canvas, (cx, cy), 14, color_bgr, 3)
+                cv2.circle(canvas, (cx, cy),  4, color_bgr, -1)
+                cv2.putText(canvas, label, (cx + 16, cy + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2, cv2.LINE_AA)
+        _draw_click(click_overlay, occ_click,  (0, 0, 255),   "occluder_click")
+        _draw_click(click_overlay, sub_click,  (0, 255, 0),   "subject_click")
+        # Overlay rejected masks in semi-transparent red so GPT sees what was wrong.
+        for mask_arr, accepted in [
+            (text_visible_mask,  sam3_text_visible_good),
+            (text_occluder_mask, sam3_text_occluder_good),
+        ]:
+            if not accepted and mask_arr.sum() > 0:
+                red_layer = np.zeros_like(click_overlay)
+                red_layer[mask_arr > 0] = (0, 0, 200)
+                click_overlay = cv2.addWeighted(click_overlay, 0.65, red_layer, 0.35, 0)
+        click_overlay_path = out_dir / "fallback_click_overlay.png"
+        cv2.imwrite(str(click_overlay_path), click_overlay)
+
+        # ── Build per-mask rejection details ──────────────────────────────────
+        vis_rejection = (
+            f"PASSED (score={tv_score:.3f} ≥ {clip_thresh})" if sam3_text_visible_good
+            else (
+                f"REJECTED — CLIP score={tv_score:.3f} below threshold {clip_thresh} "
+                f"for prompt '{text_target_prompt}'. The SAM3 text-prompt mask "
+                f"did not match the subject well enough. "
+                f"subject_click=({int((sub_click or {}).get('x',0))},{int((sub_click or {}).get('y',0))}) "
+                f"may have landed on the wrong object or at the boundary."
+            )
+        )
+        occ_rejection = (
+            "N/A (frame-crop mode)" if frame_cropped
+            else (
+                f"PASSED (score={to_score:.3f} ≥ {clip_thresh})" if sam3_text_occluder_good
+                else (
+                    f"REJECTED — CLIP score={to_score:.3f} below threshold {clip_thresh} "
+                    f"for prompt '{text_occluder_prompt}'. The SAM3 text-prompt mask "
+                    f"did not match the occluder well enough. "
+                    f"occluder_click=({int((occ_click or {}).get('x',0))},{int((occ_click or {}).get('y',0))}) "
+                    f"may have landed on the wrong object or spilled into the background."
+                )
+            )
+        )
+
         fallback_prompt = prompt + f"""
 
 ══════════════════════════════════════════════════════════════════════
-FALLBACK PASS — NUMBERED SAM3 CANDIDATES
+FALLBACK PASS — NUMBERED SAM3 CANDIDATES + CLICK REVIEW
 ══════════════════════════════════════════════════════════════════════
-At least one SAM3 text-prompt mask was rejected by CLIP. Image 1 is the original
-photo. Image 2 is a numbered SAM3 automatic-segmentation overlay.
+At least one SAM3 text-prompt mask was rejected by CLIP.
 
-Accepted text-prompt masks:
-  • visible target accepted: {sam3_text_visible_good}
-  • occluder accepted: {sam3_text_occluder_good}
+You are given THREE images:
+  Image 1 — original photo
+  Image 2 — numbered SAM3 automatic-segmentation overlay (all candidate segments)
+  Image 3 — click overlay: RED circle = occluder_click, GREEN circle = subject_click
+             Rejected masks are shown semi-transparent RED so you can see what went wrong.
 
-Now fill `selected_segment_ids` and `visible_segment_ids` using the numbered
-overlay for any rejected mask. Keep all other fields consistent with the
-original image.
+CLIP rejection details (threshold = {clip_thresh:.2f}):
+  • Visible target  ({text_target_prompt!r}):  {vis_rejection}
+  • Occluder        ({text_occluder_prompt!r}): {occ_rejection}
+
+Your previous clicks:
+  • subject_click  = ({int((sub_click  or {}).get('x',0))}, {int((sub_click  or {}).get('y',0))})
+  • occluder_click = ({int((occ_click  or {}).get('x',0))}, {int((occ_click  or {}).get('y',0))})
+
+Use Image 3 to verify whether your clicks landed on the correct objects.
+If a click was wrong (landed on background, the other object, or a boundary),
+provide corrected coordinates in `subject_click` / `occluder_click`.
+
+Use Image 2 to fill `selected_segment_ids` and `visible_segment_ids` for any
+rejected mask. Keep all other fields consistent with the original analysis.
 """
         data = gpt_vision(
-            [state["image_path"], str(sam3_viz_path)],
+            [state["image_path"], str(sam3_viz_path), str(click_overlay_path)],
             fallback_prompt, schema=OCCLUSION_SCHEMA,
-            cache_key="occlusion_analysis_auto_fallback_v1",
+            cache_key="occlusion_analysis_auto_fallback_v2",
         )
         sel_ids      = data.get("selected_segment_ids", [])
         vis_ids      = data.get("visible_segment_ids", [])
@@ -1599,8 +1389,6 @@ original image.
         region       = data.get("hidden_region", {})
         expansion    = int(data.get("boundary_expansion", config.MASK_EXPAND))
         frame_cropped = bool(data.get("frame_cropped", False))
-        exp_dirs     = data.get("expansion_directions", [])
-        exp_px       = data.get("expansion_pixels", {"top": 0, "bottom": 0, "left": 0, "right": 0})
         bbox         = [region.get("x1", 0), region.get("y1", 0),
                         region.get("x2", w), region.get("y2", h)]
         hidden_poly  = data.get("hidden_polygon", [])
@@ -1740,11 +1528,7 @@ original image.
             # Need a visible mask to anchor adjacency. Prefer CLIP visible if we
             # have it; else fall back to the visible_polygon_override.
             adj_anchor = clip_visible.copy()
-            if adj_anchor.sum() == 0:
-                vis_poly_ovr_local = data.get("visible_polygon_override", [])
-                if len(vis_poly_ovr_local) >= 3:
-                    pts_v = np.array([[int(p[0]), int(p[1])] for p in vis_poly_ovr_local], dtype=np.int32)
-                    cv2.fillPoly(adj_anchor, [pts_v], 1)
+            # visible_polygon_override disabled — use CLIP visible only
             if adj_anchor.sum() > 0:
                 adj_k = max(3, config.CLIP_ADJACENCY_PX)
                 k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (adj_k * 2 + 1, adj_k * 2 + 1))
@@ -1838,10 +1622,8 @@ original image.
         if clip_grounded and clip_occluder.sum() > 0:
             mask_candidates.append(("clip_segments", clip_occluder.astype(np.uint8).copy()))
 
-    # C) GPT polygon — kept as fallback reference.
-    if len(poly_ovr) >= 3:
-        pts = np.array([[int(p[0]), int(p[1])] for p in poly_ovr], dtype=np.int32)
-        poly_used = pts
+    # C) GPT polygon — DISABLED. Polygons from GPT are unreliable and bleed
+    #    into adjacent objects. SAM3 segments + CLIP verify + click fallback only.
 
     # D) GPT segment IDs as numbered candidates (auto-segment fallback).
     # GPT selects these from the SAM3 auto-seg viz (the numbered overlay).
@@ -1892,18 +1674,62 @@ original image.
             max(0, int(bbox[0])):min(w, int(bbox[2])),
         ] = 1
 
+    # Helper: clip secondary occluder mask to subject bbox + margin so only
+    # the overlapping portion is used as the inpaint region.
+    def _clip_to_subject_bbox(mask: np.ndarray, vis_mask: np.ndarray,
+                               margin_px: int = 40) -> np.ndarray:
+        ys, xs = np.where(vis_mask > 0)
+        if len(ys) == 0:
+            return mask
+        y1 = max(0, int(ys.min()) - margin_px)
+        y2 = min(mask.shape[0], int(ys.max()) + margin_px)
+        x1 = max(0, int(xs.min()) - margin_px)
+        x2 = min(mask.shape[1], int(xs.max()) + margin_px)
+        clipped = np.zeros_like(mask)
+        clipped[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
+        return clipped
+
     # Hidden object mask: the missing part to create. Keep this separate from the
     # occluder mask; mixing them makes background fill and object synthesis fight.
     hidden_mask = np.zeros((h, w), dtype=np.uint8)
-    hidden_poly_data = data.get("hidden_polygon", [])
-    if len(hidden_poly_data) >= 3:
-        pts_h = np.array([[int(p[0]), int(p[1])] for p in hidden_poly_data], dtype=np.int32)
-        cv2.fillPoly(hidden_mask, [pts_h], 1)
-        print(f"  Hidden object mask: {hidden_mask.sum()} px")
+    # hidden_polygon from GPT disabled — unreliable, bleeds into wrong regions.
 
     mask_save = out_dir / "occluder_mask.png"
     cv2.imwrite(str(mask_save), occluder_mask * 255)
     print(f"  Occluder mask    : {occluder_mask.sum()} px → {mask_save}")
+
+    # ── Secondary occluders (e.g. horse shoulder when frame_cropped=True) ────
+    # Run SAM3 text-prompt + click for each secondary occluder and union their
+    # masks into occluder_mask so those regions also get inpainted.
+    if secondary_occluders:
+        for sec in secondary_occluders:
+            sec_label = (sec.get("label") or "").strip()
+            sec_click = sec.get("occluder_click", {}) or {}
+            if not sec_label:
+                continue
+            print(f"  [SecOccluder] Segmenting '{sec_label}'…")
+            try:
+                sec_segs = _sam_segment_text_prompt(
+                    state["image_path"], sec_label, out_dir, f"sec_{sec_label}")
+                sec_mask = _mask_from_text_segments(sec_segs, (h, w), sec_click, f"sec_{sec_label}")
+                if sec_mask.sum() > 0:
+                    sec_score, sec_passed = _clip_verified_strict(img, sec_mask, sec_label)
+                    print(f"  [SecOccluder] '{sec_label}': {int(sec_mask.sum())} px  "
+                          f"CLIP={'PASS' if sec_passed else 'FAIL'} (score={sec_score:.3f})")
+                    if sec_passed:
+                        # Use text_visible_mask as proxy — visible_mask not yet computed
+                        _proxy_vis = text_visible_mask if text_visible_mask.sum() > 0 else np.zeros((h, w), dtype=np.uint8)
+                        sec_mask = _clip_to_subject_bbox(sec_mask, _proxy_vis)
+                        occluder_mask = np.clip(occluder_mask | sec_mask, 0, 1).astype(np.uint8)
+                        cv2.imwrite(str(out_dir / f"sec_occluder_{sec_label}.png"), sec_mask * 255)
+                        print(f"  [SecOccluder] '{sec_label}' clipped to subject bbox: "
+                              f"{int(sec_mask.sum())} px")
+                else:
+                    print(f"  [SecOccluder] '{sec_label}': SAM3 returned empty mask")
+            except Exception as exc:
+                print(f"  [SecOccluder] '{sec_label}' failed (non-fatal): {exc!r}")
+        cv2.imwrite(str(mask_save), occluder_mask * 255)
+        print(f"  Occluder mask (after secondary): {occluder_mask.sum()} px")
 
     hidden_mask_save = out_dir / "hidden_object_mask.png"
     cv2.imwrite(str(hidden_mask_save), hidden_mask * 255)
@@ -1929,16 +1755,9 @@ original image.
             else:
                 print(f"  WARNING: visible segment {sid} not found — skipped")
 
-    # Apply visible_polygon_override — used when SAM3 missed the visible subject
-    vis_poly_ovr = data.get("visible_polygon_override", [])
+    # visible_polygon_override DISABLED — GPT polygons bleed into adjacent objects.
+    # SAM3 text-prompt + CLIP verify is authoritative for the visible mask.
     vis_poly_used = None
-    if len(vis_poly_ovr) >= 3:
-        pts_v = np.array([[int(p[0]), int(p[1])] for p in vis_poly_ovr], dtype=np.int32)
-        vis_poly_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(vis_poly_mask, [pts_v], 1)
-        visible_mask = np.clip(visible_mask | vis_poly_mask, 0, 1)
-        vis_poly_used = pts_v
-        print(f"  Visible polygon override applied ({len(vis_poly_ovr)} pts, area={vis_poly_mask.sum()} px)")
 
 
     # Fallback: when visible_mask is absent or too small, estimate visible region
@@ -2153,6 +1972,181 @@ original image.
         except Exception as exc:                              # noqa: BLE001
             print(f"  [MaskReview] review step failed: {exc!r} — keeping pre-review mask")
 
+    # ── Secondary occluder detection via visible-mask gap analysis ───────────
+    # If GPT returned no secondary occluders AND frame_cropped=True, show GPT
+    # the visible mask overlay so it can SEE the gaps/holes in the segmentation
+    # and identify what in-scene object is causing each gap.
+    if frame_cropped and not secondary_occluders and visible_mask.sum() > 0:
+        try:
+            # Build overlay: green = visible person pixels, red = gaps inside bbox
+            ys, xs = np.where(visible_mask > 0)
+            if len(ys) > 0:
+                vx1, vy1 = int(xs.min()), int(ys.min())
+                vx2, vy2 = int(xs.max()), int(ys.max())
+                gap_overlay = img.copy()
+                # Green for visible pixels
+                green_layer = np.zeros_like(gap_overlay)
+                green_layer[visible_mask > 0] = (0, 200, 0)
+                gap_overlay = cv2.addWeighted(gap_overlay, 0.55, green_layer, 0.45, 0)
+                # Red for gaps: pixels inside bbox but NOT in visible_mask
+                bbox_mask = np.zeros((h, w), dtype=np.uint8)
+                bbox_mask[vy1:vy2, vx1:vx2] = 1
+                gap_mask = (bbox_mask & ~visible_mask).astype(np.uint8)
+                red_layer = np.zeros_like(gap_overlay)
+                red_layer[gap_mask > 0] = (0, 0, 220)
+                gap_overlay = cv2.addWeighted(gap_overlay, 0.65, red_layer, 0.35, 0)
+                gap_overlay_path = out_dir / "sec_occluder_gap_overlay.png"
+                cv2.imwrite(str(gap_overlay_path), gap_overlay)
+
+                gap_prompt = f"""You are a computer vision expert analyzing a segmentation result.
+
+Image 1: the original photo.
+Image 2: segmentation overlay — GREEN pixels = the visible portion of the "{hint or target_class}" that was successfully segmented.
+RED pixels = GAPS inside the subject bounding box that were NOT captured in the segmentation.
+
+Your task: identify what in-scene object is causing each RED gap.
+RED gaps appear when a foreground object partially overlaps the subject, preventing it from being segmented there.
+
+For EACH distinct in-scene object causing a RED gap, provide:
+  - "label": 1–3 word class noun (e.g. "horse", "fence", "arm")
+  - "occluder_click": pixel at the center of that object in the ORIGINAL image
+  - "segment_ids": []
+
+Respond ONLY in JSON:
+{{"secondary_occluders": [
+  {{"label": "...", "occluder_click": {{"x": 0, "y": 0}}, "segment_ids": []}},
+  ...
+]}}
+
+If the RED gaps are caused by image boundary (not an in-scene object), return {{"secondary_occluders": []}}.
+"""
+                sec_schema = {
+                    "name": "secondary_occluder_detection",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "secondary_occluders": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label":          {"type": "string"},
+                                        "occluder_click": {
+                                            "type": "object",
+                                            "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}},
+                                            "required": ["x", "y"],
+                                            "additionalProperties": False,
+                                        },
+                                        "segment_ids": {"type": "array", "items": {"type": "integer"}},
+                                    },
+                                    "required": ["label", "occluder_click", "segment_ids"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["secondary_occluders"],
+                        "additionalProperties": False,
+                    },
+                }
+                print("  [SecOccluder] Running gap-analysis GPT call…")
+                sec_data = gpt_vision(
+                    [state["image_path"], str(gap_overlay_path)],
+                    gap_prompt, schema=sec_schema,
+                )
+                secondary_occluders = sec_data.get("secondary_occluders", []) or []
+                if secondary_occluders:
+                    print(f"  [SecOccluder] Gap analysis found: "
+                          f"{[o.get('label') for o in secondary_occluders]}")
+                    # Intersection approach with convex hull clipping:
+                    #   1. Run SAM3 on each occluder to get its mask
+                    #   2. Dilate visible_mask by BODY_MARGIN → expected person boundary
+                    #   3. Compute convex hull of visible_mask contour → person body shape
+                    #   4. hidden_shoulder = SAM3(occluder) ∩ expected_boundary ∩ hull ∩ ~visible
+                    #
+                    # The convex hull clips the mask to the person's actual body contour —
+                    # any pixel outside the hull (e.g. horse face above person's head) is removed.
+                    BODY_MARGIN = 15  # px — tight ring just outside visible edge
+                    body_kernel = np.ones((BODY_MARGIN * 2 + 1,
+                                           BODY_MARGIN * 2 + 1), np.uint8)
+                    expected_body = cv2.dilate(
+                        visible_mask.astype(np.uint8), body_kernel, iterations=1)
+                    expected_boundary = (
+                        (expected_body > 0) & ~(visible_mask > 0)
+                    ).astype(np.uint8)
+
+                    # Convex hull of person contour → strict body boundary
+                    hull_mask = np.zeros((h, w), dtype=np.uint8)
+                    contours, _ = cv2.findContours(
+                        visible_mask.astype(np.uint8),
+                        cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        all_pts = np.vstack(contours)
+                        hull = cv2.convexHull(all_pts)
+                        cv2.fillPoly(hull_mask, [hull], 1)
+                    cv2.imwrite(str(out_dir / "sec_occluder_hull.png"), hull_mask * 255)
+
+                    combined_occ_mask = np.zeros((h, w), dtype=np.uint8)
+                    for sec in secondary_occluders:
+                        sec_label = (sec.get("label") or "").strip()
+                        sec_click = sec.get("occluder_click", {}) or {}
+                        if not sec_label:
+                            continue
+                        try:
+                            print(f"  [SecOccluder] SAM3 segmenting '{sec_label}'…")
+                            sec_segs = _sam_segment_text_prompt(
+                                state["image_path"], sec_label, out_dir,
+                                f"sec_{sec_label}")
+                            sec_mask = _mask_from_text_segments(
+                                sec_segs, (h, w), sec_click, f"sec_{sec_label}")
+                            if sec_mask.sum() == 0:
+                                print(f"  [SecOccluder] '{sec_label}': SAM3 returned empty")
+                                continue
+                            # Intersection: occluder ∩ expected_boundary ∩ gap ∩ hull
+                            # The convex hull clips to the person's actual body contour.
+                            hidden_shoulder = (
+                                (sec_mask > 0) & (expected_boundary > 0) &
+                                (gap_mask > 0) & (hull_mask > 0)
+                            ).astype(np.uint8)
+                            # Keep only the LARGEST connected component —
+                            # filters out small scattered blobs (e.g. lead rope artifacts).
+                            if hidden_shoulder.sum() > 0:
+                                n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                                    hidden_shoulder, connectivity=8)
+                                if n_labels > 1:
+                                    # label 0 = background, find largest foreground
+                                    largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+                                    hidden_shoulder = (labels == largest).astype(np.uint8)
+                            print(f"  [SecOccluder] '{sec_label}': "
+                                  f"SAM3={int(sec_mask.sum())} px  "
+                                  f"→ intersection+hull+largest_cc={int(hidden_shoulder.sum())} px")
+                            combined_occ_mask = np.clip(
+                                combined_occ_mask | hidden_shoulder, 0, 1
+                            ).astype(np.uint8)
+                            cv2.imwrite(
+                                str(out_dir / f"sec_occluder_{sec_label}.png"),
+                                sec_mask * 255)
+                            cv2.imwrite(
+                                str(out_dir / f"sec_occluder_{sec_label}_shoulder.png"),
+                                hidden_shoulder * 255)
+                        except Exception as exc:
+                            print(f"  [SecOccluder] '{sec_label}' failed: {exc!r}")
+
+                    if combined_occ_mask.sum() > 0:
+                        occluder_mask = np.clip(
+                            occluder_mask | combined_occ_mask, 0, 1).astype(np.uint8)
+                        mask_save = out_dir / "occluder_mask.png"
+                        cv2.imwrite(str(mask_save), occluder_mask * 255)
+                        cv2.imwrite(str(out_dir / "sec_occluder_gap.png"), gap_mask * 255)
+                        cv2.imwrite(str(out_dir / "expected_boundary.png"),
+                                    expected_boundary * 255)
+                        print(f"  [SecOccluder] final occluder_mask: "
+                              f"{int(occluder_mask.sum())} px")
+                else:
+                    print("  [SecOccluder] Gap analysis: no in-scene occluders found in gaps")
+        except Exception as exc:
+            print(f"  [SecOccluder] Gap analysis failed (non-fatal): {exc!r}")
+
     # ── Geometric hidden_object_mask reconstruction ──────────────────────────
     # The original `hidden_mask` came from GPT's hidden_polygon, which is often
     # placed in the wrong region (e.g. on the bear's face instead of the chest).
@@ -2324,46 +2318,6 @@ original image.
               f"(completion-only = {int(completion.sum())} px) → "
               f"subject_full_amodal_mask.png")
 
-        # ── step 3: off-frame extension via GPT-V on padded canvas ─────────
-        # Fires when GPT flagged frame_cropped=True with non-zero
-        # expansion_pixels, OR when config.FORCE_FRAME_CROPPED is set (debug).
-        offframe_px = (force_exp_px if force_offframe else exp_px) \
-            if (force_offframe or frame_cropped) else None
-        if (
-            offframe_px is not None
-            and isinstance(offframe_px, dict)
-            and (offframe_px.get("top", 0) or offframe_px.get("bottom", 0)
-                 or offframe_px.get("left", 0) or offframe_px.get("right", 0))
-        ):
-            padded_full, offframe_only, padded_img, offsets = \
-                _flux_extend_amodal_mask_offframe(
-                    image_bgr=img,
-                    in_frame_amodal_mask=reviewed_mask,
-                    expansion_pixels=offframe_px,
-                    subject_text=target_class or target_short or "the subject",
-                    out_dir=out_dir,
-                )
-            if padded_full is not None:
-                # Persist padded outputs.
-                cv2.imwrite(str(out_dir / "padded_canvas.png"), padded_img)
-                cv2.imwrite(str(out_dir / "subject_full_amodal_padded.png"),
-                            padded_full * 255)
-                cv2.imwrite(str(out_dir / "subject_offframe_only_mask.png"),
-                            offframe_only * 255)
-                # Transparent versions for visual inspection.
-                Hp, Wp = padded_full.shape[:2]
-                rgba_pad = np.zeros((Hp, Wp, 4), dtype=np.uint8)
-                rgba_pad[..., :3] = padded_img
-                rgba_pad[..., 3]  = (padded_full > 0).astype(np.uint8) * 255
-                cv2.imwrite(str(transp_dir / "subject_full_amodal_padded.png"),
-                            rgba_pad)
-                # Save offsets json so downstream can map padded↔original.
-                (out_dir / "padded_offsets.json").write_text(
-                    json.dumps(offsets, indent=2))
-                print(f"  [Amodal/offframe] padded mask {int(padded_full.sum())} px, "
-                      f"off-frame only {int(offframe_only.sum())} px → "
-                      f"subject_full_amodal_padded.png "
-                      f"+ subject_offframe_only_mask.png")
     except Exception as exc:                                      # noqa: BLE001
         traceback.print_exc()
         print(f"  [Amodal/reviewed] skipped: {exc!r}")
@@ -2443,8 +2397,6 @@ original image.
         "boundary_expansion":    expansion,
         "region_desc":           region.get("description", ""),
         "frame_cropped":         frame_cropped,
-        "expansion_directions":  exp_dirs,
-        "expansion_pixels":      exp_px,
         "mask_path":             str(mask_save),
         "visible_mask_path":     str(visible_mask_save),
         "hidden_mask_path":      str(hidden_mask_save),
@@ -2474,7 +2426,6 @@ def reviewer(state: State) -> dict:
     if frame_cropped:
         mode_context = f"""MODE: Frame-crop completion
   - "{target}" was cut off at the image frame boundary.
-  - Expansion direction(s): {state.get("expansion_directions", [])}
   - Subject description: {subject_desc}
   - Parts that WERE visible in original: {visible_parts_desc}
   - Parts that WERE MISSING and should now appear: {missing_parts_desc}
@@ -2768,13 +2719,17 @@ def completion_agent(state: State) -> dict:
     print(f"  visible mask: {int(vis_b.sum())} px")
     print(f"  amodal  mask: {int(am_b.sum())} px")
 
-    # ── Step 3: Flux inpaints the dilated-occluder region (Jiang Ao-style) ─
-    # No predicted amodal silhouette. The inpaint region is exactly what
-    # Jiang Ao uses for in-frame iter 0: dilate(occluder_mask) − visible.
-    # Their kernel is 5×5 with 3 iters (~15 px). Flux fills "complete <subject>"
-    # into the dilated occluder; SAM3 post-seg of Flux's output then
-    # recovers the actual amodal silhouette (including thin legs that no
-    # 60-vertex polygon could trace).
+    # ── Step 3: Determine hidden (inpaint) region ────────────────────────────
+    # Two paths based on USE_AMODAL_COMPLETION:
+    #
+    # A) USE_AMODAL_COMPLETION=True (Jiang Ao proper):
+    #    Agent 1 ran _gpt_amodal_subject_mask → saved subject_full_amodal_mask.png
+    #    hidden = amodal_mask − visible_mask  (exact hidden slice per the paper)
+    #    The cutout base = visible pixels on gray; Flux fills the hidden slice.
+    #
+    # B) USE_AMODAL_COMPLETION=False (fallback, occluder-derived):
+    #    hidden = dilate(occluder, 5×5, 3) − visible  (Jiang Ao iter-0 approx)
+    #    Worse quality — use only when no amodal silhouette is available.
     occluder_path = out_dir / "occluder_mask.png"
     if occluder_path.exists():
         occ_mask = cv2.imread(str(occluder_path), cv2.IMREAD_GRAYSCALE)
@@ -2783,16 +2738,27 @@ def completion_agent(state: State) -> dict:
         occ_b = (occ_mask > 127).astype(np.uint8)
     else:
         occ_b = np.zeros((h, w), dtype=np.uint8)
-    # Match amodal/main.py:725-726 for iter 0
-    JA_KERNEL = np.ones((5, 5), np.uint8)
-    JA_ITERS  = 3
-    occ_dilated = cv2.dilate(occ_b, JA_KERNEL, iterations=JA_ITERS).astype(np.uint8)
-    hidden = (occ_dilated & (1 - vis_b)).astype(np.uint8)
-    am_b   = (vis_b | hidden).astype(np.uint8)   # used by off-frame boundary check below
-    print(f"  visible: {int(vis_b.sum())} px   occluder: {int(occ_b.sum())} px   "
-          f"occ_dilated: {int(occ_dilated.sum())} px")
-    print(f"  hidden = dilate(occluder, 5x5, 3) \\ visible: {int(hidden.sum())} px  "
-          f"(Jiang Ao iter-0 mask)")
+
+    _use_amodal = (
+        bool(getattr(config, "USE_AMODAL_COMPLETION", False))
+        and int(am_b.sum()) > int(vis_b.sum())   # amodal must be bigger than visible
+    )
+    if _use_amodal:
+        # Jiang Ao proper: hidden = amodal − visible
+        hidden = (am_b & (1 - vis_b)).astype(np.uint8)
+        print(f"  visible: {int(vis_b.sum())} px   amodal: {int(am_b.sum())} px")
+        print(f"  hidden = amodal - visible: {int(hidden.sum())} px  (USE_AMODAL_COMPLETION)")
+    else:
+        # Fallback: Jiang Ao iter-0 occluder-dilated approximation
+        JA_KERNEL   = np.ones((5, 5), np.uint8)
+        JA_ITERS    = 3
+        occ_dilated = cv2.dilate(occ_b, JA_KERNEL, iterations=JA_ITERS).astype(np.uint8)
+        hidden = (occ_dilated & (1 - vis_b)).astype(np.uint8)
+        am_b   = (vis_b | hidden).astype(np.uint8)
+        print(f"  visible: {int(vis_b.sum())} px   occluder: {int(occ_b.sum())} px   "
+              f"occ_dilated: {int(occ_dilated.sum())} px")
+        print(f"  hidden = dilate(occluder, 5x5, 3) \\ visible: {int(hidden.sum())} px  "
+              f"(Jiang Ao iter-0 mask)")
 
     # CUTOUT: keep ONLY (eroded) visible person pixels.  Hidden slice +
     # everything else is neutral gray.  The 5×5 erosion (Jiang Ao
@@ -2807,59 +2773,98 @@ def completion_agent(state: State) -> dict:
     cv2.imwrite(str(test_dir / "hidden_inpaint_mask.png"), hidden * 255)
 
     # ── Step 5: run Flux-Fill (skip if hidden region is empty) ───────────
-    if int(hidden.sum()) < 50:
-        print(f"\nHidden region is empty / tiny ({int(hidden.sum())} px) — "
-              f"skipping Flux. Cutout is the final output.")
+    _frame_cropped = bool(state.get("frame_cropped", False))
+    _do_inframe_flux = int(hidden.sum()) >= 50   # True = run in-frame Flux
+    if not _do_inframe_flux:
+        if _frame_cropped:
+            print(f"\nHidden region empty ({int(hidden.sum())} px) but frame_cropped=True "
+                  f"— skipping in-frame Flux, proceeding to off-frame extension.")
+        else:
+            print(f"\nHidden region empty ({int(hidden.sum())} px) — skipping Flux.")
         flux_bgr = cutout.copy()
-        # Save the same outputs as the Flux path for downstream consistency.
+        final_mask = vis_b.copy()
         cv2.imwrite(str(test_dir / "flux_completed_restored.png"), flux_bgr)
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
         rgba[..., :3] = flux_bgr
-        rgba[..., 3]  = (am_b * 255).astype(np.uint8)
+        rgba[..., 3]  = (vis_b * 255).astype(np.uint8)
         cv2.imwrite(str(test_dir / "flux_completed_rgba.png"), rgba)
-
-        overlay_in = img_bgr.copy()
-        ov = np.zeros_like(overlay_in)
-        ov[hidden == 1] = (255, 0, 255)
-        ov[vis_b == 1]  = (0, 255, 0)
-        overlay_in = cv2.addWeighted(overlay_in, 0.55, ov, 0.45, 0)
-        _make_comparison(
-            panels=[img_bgr, overlay_in, cutout,
-                    cv2.cvtColor(hidden * 255, cv2.COLOR_GRAY2BGR), flux_bgr],
-            labels=["A: original", "B: green=visible (no hidden region)",
-                    "C: person cutout (final)", "D: hidden mask (empty)",
-                    "E: same as cutout (Flux skipped)"],
-            out_path=test_dir / "comparison.png",
-        )
-        print(f"\nOutputs → {test_dir}/")
-        return {
-            **state,
-            "attempt":          state.get("attempt", 0) + 1,
-            "output_path":      str(test_dir / "flux_completed_restored.png"),
-            "output_rgba_path": str(test_dir / "flux_completed_rgba.png"),
-        }
+        if not _frame_cropped:
+            # Non-frame-crop with empty hidden: nothing to do, return early.
+            overlay_in = img_bgr.copy()
+            ov = np.zeros_like(overlay_in)
+            ov[vis_b == 1] = (0, 255, 0)
+            overlay_in = cv2.addWeighted(overlay_in, 0.55, ov, 0.45, 0)
+            _make_comparison(
+                panels=[img_bgr, overlay_in, cutout,
+                        cv2.cvtColor(hidden * 255, cv2.COLOR_GRAY2BGR), flux_bgr],
+                labels=["A: original", "B: green=visible",
+                        "C: cutout", "D: hidden (empty)", "E: result"],
+                out_path=test_dir / "comparison.png",
+            )
+            print(f"\nOutputs → {test_dir}/")
+            return {
+                **state,
+                "attempt":          state.get("attempt", 0) + 1,
+                "output_path":      str(test_dir / "flux_completed_restored.png"),
+                "output_rgba_path": str(test_dir / "flux_completed_rgba.png"),
+            }
 
     cutout_rgb = cv2.cvtColor(cutout, cv2.COLOR_BGR2RGB)
-    subject_text = (getattr(config, "TARGET", "") or "subject").strip()
-    prompt = (
-        f"Photorealistic complete {subject_text}, full body continuing "
-        f"seamlessly from the visible portion behind the occluder. Matching "
-        f"lighting, texture, anatomy and color. Sharp focus, high detail. "
-        f"Plain neutral background."
-    )
-    neg_extra = "distorted anatomy, duplicate parts, blurry, low detail"
+    subject_text  = (getattr(config, "TARGET", "") or "subject").strip()
+    subject_desc  = (state.get("subject_description", "") or "").strip()
+    missing_parts = (state.get("missing_parts", "") or "").strip()
+    visible_parts = (state.get("visible_parts", "") or "").strip()
 
-    print(f"\nRunning Flux-Fill on the cutout…")
+    # ── Flux prompts ─────────────────────────────────────────────────────────
+    # Positive: describe what should appear in the masked region — anatomy,
+    # clothing, skin tone, pose — grounded in Agent 1's subject_description
+    # and missing_parts. Keep under ~77 CLIP tokens to avoid T5 truncation.
+    desc_short    = subject_desc[:100]  if subject_desc   else ""
+    missing_short = missing_parts[:100] if missing_parts  else ""
+
+    if desc_short and missing_short:
+        positive_prompt = (
+            f"Photorealistic {subject_text}, {desc_short}. "
+            f"Reveal hidden parts: {missing_short}. "
+            f"Seamless continuation, matching lighting and color."
+        )
+    elif desc_short:
+        positive_prompt = (
+            f"Photorealistic {subject_text}, {desc_short}. "
+            f"Complete hidden body parts seamlessly, matching anatomy and color."
+        )
+    else:
+        positive_prompt = (
+            f"Photorealistic {subject_text}, complete body revealed, "
+            f"seamless continuation, matching lighting, texture and color."
+        )
+
+    negative_prompt = (
+        "horse, animal, fence, occluder, foreign object, "
+        "distorted anatomy, extra limbs, duplicate body parts, "
+        "blurry, low quality, artifacts, wrong skin tone, watermark"
+    )
+    neg_extra = negative_prompt  # alias used by off-frame extension loop
+
+    print(f"  [+] {positive_prompt[:180]}")
+    print(f"  [-] {negative_prompt}")
+
+    # Pass the ORIGINAL IMAGE as base (not the gray cutout) so Flux has
+    # full scene context — lighting, background, surrounding pixels.
+    # The inpaint_mask tells Flux exactly which pixels to regenerate.
+    orig_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    print(f"\nRunning Flux-Fill on original image (mask={int(hidden.sum())} px)…")
     t0 = time.time()
     flux_results = _run_flux_fill_inpaint(
-        base_np=cutout_rgb,
+        base_np=orig_rgb,
         inpaint_mask=hidden,
         amodal_rgb_256=np.full((256, 256, 3), 255, dtype=np.uint8),
-        prompt=prompt,
+        prompt=positive_prompt,
         n_samples=1,
         out_dir=test_dir,
         prefix="flux_completed",
-        neg_extra=neg_extra,
+        neg_extra=negative_prompt,
         seed_offset=0,
         strength=1.0,
     )
@@ -2979,14 +2984,29 @@ def completion_agent(state: State) -> dict:
     cv2.imwrite(str(test_dir / "flux_completed_white_bg.png"), white_bg)
 
     # ── Step 5b: iterative off-frame extension (Jiang Ao CVPR'25) ────────
-    # If the in-frame silhouette still reaches the canvas edge, pad those
-    # sides with gray and rerun Flux into the new strip. Loop up to
-    # MAX_OFFFRAME_ITERS, stopping early when no edge is touched or the
-    # post-Flux SAM3 re-segmentation fails to extend the silhouette.
+    # Only run when GPT confirmed the subject is actually frame-cropped.
+    # Edge-touch alone is not reliable on white-bg cutouts — SAM3 often
+    # returns a large mask that reaches the canvas edge even when the
+    # subject is fully within the original frame.
     current_bgr   = flux_bgr.copy()
     current_mask  = final_mask.copy()
-    sides_touched = _check_touch_boundary(current_mask)
-    print(f"\n[OffFrame] sides touched after in-frame Flux: {sides_touched or 'none'}")
+
+    # Determine which sides to extend using GPT's hidden_region —
+    # only pad the edges the subject actually exits, not all SAM3-touching edges.
+    # SAM3 after Flux often returns large masks that touch all 4 edges, causing
+    # unnecessary 4-sided padding. GPT's hidden_region is more reliable.
+    if _frame_cropped:
+        _hr = state.get("hidden_region") or {}
+        _gpt_sides = set()
+        if int(_hr.get("x1", 1)) == 0:          _gpt_sides.add("left")
+        if int(_hr.get("y1", 1)) == 0:          _gpt_sides.add("top")
+        if int(_hr.get("x2", 0)) >= w - 2:      _gpt_sides.add("right")
+        if int(_hr.get("y2", 0)) >= h - 2:      _gpt_sides.add("bottom")
+        # Fallback to SAM3 boundary check if GPT gave no usable edge info
+        sides_touched = _gpt_sides if _gpt_sides else _check_touch_boundary(current_mask)
+    else:
+        sides_touched = set()
+    print(f"\n[OffFrame] frame_cropped={_frame_cropped}  sides touched: {sides_touched or 'none'}")
 
     iter_canvases   = []   # (label, bgr) tuples for comparison
     iter_canvases.append(("OF0: in-frame Flux", current_bgr.copy()))
@@ -3017,18 +3037,17 @@ def completion_agent(state: State) -> dict:
         cv2.imwrite(str(test_dir / f"offframe_iter{it}_input.png"),    padded_bgr)
         cv2.imwrite(str(test_dir / f"offframe_iter{it}_mask.png"),     outpaint_mask * 255)
 
-        # Build a per-side directional prompt suffix (subject-agnostic).
+        # Build a per-side directional prompt using subject details from Agent 1.
         dir_phrases = []
         if "bottom" in sides_touched: dir_phrases.append("body extending downward")
         if "top"    in sides_touched: dir_phrases.append("body extending upward")
         if "left"   in sides_touched: dir_phrases.append("body extending to the left")
         if "right"  in sides_touched: dir_phrases.append("body extending to the right")
         dir_clause = "; ".join(dir_phrases) or "body continuing into the surrounding area"
+        desc_clause = f" {subject_desc[:100]}" if subject_desc else ""
         iter_prompt = (
-            f"Photorealistic complete {subject_text}, {dir_clause}. "
-            f"Natural anatomy and form continuing seamlessly from the "
-            f"visible body, with matching lighting, texture and color. "
-            f"Sharp focus, high detail. Plain neutral background."
+            f"Photorealistic {subject_text},{desc_clause} {dir_clause}. "
+            f"Natural anatomy continuing seamlessly, matching lighting and color."
         )
 
         t1 = time.time()

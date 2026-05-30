@@ -19,23 +19,8 @@ OCCLUSION_SCHEMA = {
             "subject_description": {"type": "string"},
             "visible_parts":       {"type": "string"},
             "missing_parts":       {"type": "string"},
-            # Frame-crop completion fields
+            # Frame-crop flag
             "frame_cropped": {"type": "boolean"},
-            "expansion_directions": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "expansion_pixels": {
-                "type": "object",
-                "properties": {
-                    "top":    {"type": "integer"},
-                    "bottom": {"type": "integer"},
-                    "left":   {"type": "integer"},
-                    "right":  {"type": "integer"},
-                },
-                "required": ["top", "bottom", "left", "right"],
-                "additionalProperties": False,
-            },
             # Classic occlusion fields
             "selected_segment_ids": {
                 "type": "array",
@@ -89,14 +74,42 @@ OCCLUSION_SCHEMA = {
                 "required": ["x", "y"],
                 "additionalProperties": False,
             },
+            # Secondary in-scene occluders (e.g. horse occluding shoulder
+            # when the primary issue is frame-crop). Each entry drives its
+            # own SAM3 text-prompt + inpaint pass.
+            "secondary_occluders": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "occluder_click": {
+                            "type": "object",
+                            "properties": {
+                                "x": {"type": "integer"},
+                                "y": {"type": "integer"},
+                            },
+                            "required": ["x", "y"],
+                            "additionalProperties": False,
+                        },
+                        "segment_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
+                    },
+                    "required": ["label", "occluder_click", "segment_ids"],
+                    "additionalProperties": False,
+                },
+            },
         },
         "required": [
             "occluded_object", "occluder", "what_to_remove",
             "subject_description", "visible_parts", "missing_parts",
-            "frame_cropped", "expansion_directions", "expansion_pixels",
+            "frame_cropped",
             "selected_segment_ids", "visible_segment_ids",
             "polygon_override", "visible_polygon_override", "hidden_region", "boundary_expansion",
             "hidden_polygon", "occluder_click", "subject_click",
+            "secondary_occluders",
         ],
         "additionalProperties": False,
     },

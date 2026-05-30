@@ -21,8 +21,6 @@ class State(TypedDict):
     visible_parts:      str           # body parts currently visible in frame
     missing_parts:      str           # body parts cut off / expected but absent
     frame_cropped:      bool          # True when subject is cut off at image boundary
-    expansion_directions: list        # e.g. ["bottom"] or ["right", "bottom"]
-    expansion_pixels:   Optional[dict]  # {top, bottom, left, right} pixels to add
     mask_path:              Optional[str]   # binary occluder mask
     visible_mask_path:      Optional[str]   # binary modal mask (visible part of occluded obj)
     hidden_mask_path:       Optional[str]   # binary amodal target region (missing part to generate)

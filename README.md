@@ -63,7 +63,7 @@ Driven by **SAM3** (segmentation) + **GPT-5 Responses API** (scene reasoning) + 
 - **SAM3** for visible/occluder segmentation — newer than LISA / Grounded-SAM, no 13B LLM backbone needed.
 - **GPT-5 via Responses API** with `reasoning='high'` replaces local language models (LISA-13B) for scene reasoning. Network call, ~2 GB GPU savings.
 - **No predicted amodal polygon** — `USE_AMODAL_COMPLETION=False`. The Jiang Ao iter-0 inpaint mask (dilated occluder) lets Flux decide where hidden anatomy goes. Avoids the 60-vertex polygon truncating thin appendages like bird legs.
-- **FLUX.1-Fill-dev** for inpainting — strongest anatomy/texture priors available. Runs via diffusers' sequential CPU offload on 12 GB GPUs.
+- **FLUX.1-Fill-dev** for inpainting — strongest anatomy/texture priors available. Runs fully on device on 24 GB+ cards; falls back to `enable_model_cpu_offload` (`FLUX_FILL_CPU_OFFLOAD=True`) on smaller GPUs.
 - **Iterative off-frame extension** (Jiang Ao 2025) — silhouettes that touch the frame edge get padded canvas + outpaint until contained.
 - **IoU-based PostSeg** + **alpha blending** ported from Jiang Ao's `filter_out_amodal_segmentation` + `alpha_blending` (`amodal/main.py`).
 
@@ -77,7 +77,7 @@ Designed and tested on:
 | RAM | 14 GB (with 32 GB swap on NVMe) |
 | OS | Linux |
 
-Per Flux pass: ~9–12 s/step × 50 steps ≈ 7–10 min. Typical run with 1–2 off-frame iters: 15–25 min wall-clock. GPU is PCIe-bound, not compute-bound — Flux is 24 GB in bf16 and must stream through sequential offload.
+Per Flux pass: ~9–12 s/step × 50 steps ≈ 7–10 min. Typical run with 1–2 off-frame iters: 15–25 min wall-clock. GPU is PCIe-bound, not compute-bound — Flux is 24 GB in bf16 and must stream through `enable_model_cpu_offload` on this hardware. On 24 GB+ cards Flux runs fully on device and this drops to a couple minutes per pass.
 
 Quality-neutral Ampere perf flags (`cudnn.benchmark`, TF32 matmul, VAE tiling/slicing) are enabled in `main.py`.
 
@@ -154,8 +154,8 @@ All in `config.py`. Currently-validated defaults:
 | `USE_PSALM` | `False` | over-segmented nature scenes |
 | `USE_INSTAORDER` | `True` | InstaOrder is the only useful occluder-ranking signal here |
 | `USE_DEPTH_RANK` | `True` | corroborates InstaOrder on same-class occluders |
-| `FLUX_FILL_SEQUENTIAL_OFFLOAD` | `True` | required on 12 GB GPU |
-| `GPU_MEMORY_LIMIT_GB` | `10.0` | hard cap, leaves OS headroom |
+| `FLUX_FILL_CPU_OFFLOAD` | `False` | Flux runs fully on device; disable on <24 GB cards |
+| `GPU_MEMORY_LIMIT_GB` | `44.0` | hard cap, leaves OS headroom (tuned for a 48 GB card) |
 
 ## What's intentionally not in this repo
 

@@ -18,6 +18,9 @@ Usage:
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -133,6 +136,17 @@ def _make_comparison(panels: list, labels: list, out_path: Path) -> None:
     cv2.imwrite(str(out_path), grid)
 
 
+def _publish_final(test_dir: Path, rgba_src: Path, subject_slug: str) -> None:
+    """Copy the final RGBA cutout + comparison grid into test_dir/final/."""
+    final_dir = test_dir / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    if rgba_src.exists():
+        shutil.copy2(rgba_src, final_dir / f"{subject_slug}_final.png")
+    comparison_src = test_dir / "comparison.png"
+    if comparison_src.exists():
+        shutil.copy2(comparison_src, final_dir / "comparison.png")
+
+
 def main() -> int:
     img_path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMAGE)
     if not img_path.exists():
@@ -145,9 +159,13 @@ def main() -> int:
     import main as test3_main           # noqa: E402
     import config                       # noqa: E402
 
+    input_prompt = (getattr(config, "INPUT_PROMPT", "") or "").strip()
+    subject_text = input_prompt or "subject"
+    subject_slug = re.sub(r"[^a-z0-9]+", "_", subject_text.lower()).strip("_") or "subject"
+
     out_dir = test3_main.BASE_DIR / "output" / stem
     out_dir.mkdir(parents=True, exist_ok=True)
-    test_dir = out_dir / "_flux_cutout_person"
+    test_dir = out_dir / f"_flux_cutout_{subject_slug}"
     test_dir.mkdir(parents=True, exist_ok=True)
     print(f"Out dir: {test_dir}")
 
@@ -160,7 +178,7 @@ def main() -> int:
         config.IMAGE_PATH = str(img_path)
         state = {
             "image_path":            str(img_path),
-            "target":                "",
+            "target":                input_prompt,
             "occluded_object":       "",
             "occluder":              "",
             "what_to_remove":        "",
@@ -191,10 +209,21 @@ def main() -> int:
             "best_score":            0.0,
         }
         t0 = time.time()
-        test3_main.occlusion_agent(state)
+        agent1_result = test3_main.occlusion_agent(state)
         print(f"Agent 1 done in {time.time() - t0:.1f}s")
+        if not input_prompt:
+            detected = (agent1_result or {}).get("occluded_object", "").strip()
+            if detected:
+                subject_text = detected
+                print(f"  No input prompt given — using Agent 1's own "
+                      f"detection for the completion prompt: '{subject_text}'")
+        occluder_text = (agent1_result or {}).get("occluder", "").strip()
+        if occluder_text:
+            print(f"  Occluder identified as '{occluder_text}' — will be "
+                  f"explicitly excluded from the Flux prompt")
     else:
         print(f"Reusing cached masks from {out_dir}/")
+        occluder_text = ""
 
     # ── Step 2: load image + masks ───────────────────────────────────────
     img_bgr = cv2.imread(str(img_path))
@@ -245,7 +274,7 @@ def main() -> int:
                              iterations=1).astype(np.uint8)
     cutout = np.full_like(img_bgr, PAD_COLOR)
     cutout[vis_b_eroded == 1] = img_bgr[vis_b_eroded == 1]
-    cv2.imwrite(str(test_dir / "person_cutout.png"), cutout)
+    cv2.imwrite(str(test_dir / f"{subject_slug}_cutout.png"), cutout)
     cv2.imwrite(str(test_dir / "hidden_inpaint_mask.png"), hidden * 255)
 
     # ── Step 5: run Flux-Fill (skip if hidden region is empty) ───────────
@@ -269,50 +298,126 @@ def main() -> int:
             panels=[img_bgr, overlay_in, cutout,
                     cv2.cvtColor(hidden * 255, cv2.COLOR_GRAY2BGR), flux_bgr],
             labels=["A: original", "B: green=visible (no hidden region)",
-                    "C: person cutout (final)", "D: hidden mask (empty)",
+                    f"C: {subject_text} cutout (final)", "D: hidden mask (empty)",
                     "E: same as cutout (Flux skipped)"],
             out_path=test_dir / "comparison.png",
         )
+        _publish_final(test_dir, test_dir / "flux_completed_rgba.png", subject_slug)
         print(f"\nOutputs → {test_dir}/")
         return 0
 
     cutout_rgb = cv2.cvtColor(cutout, cv2.COLOR_BGR2RGB)
-    subject_text = (getattr(config, "TARGET", "") or "subject").strip()
+    occluder_clause = (
+        f" Do NOT draw, regenerate, or leave any part of the {occluder_text} "
+        f"in the completed region — only the {subject_text}'s own body may "
+        f"appear there."
+    ) if occluder_text else ""
     prompt = (
         f"Photorealistic complete {subject_text}, full body continuing "
         f"seamlessly from the visible portion behind the occluder. Matching "
         f"lighting, texture, anatomy and color. Sharp focus, high detail. "
-        f"Plain neutral background."
+        f"Plain neutral background.{occluder_clause}"
     )
     neg_extra = "distorted anatomy, duplicate parts, blurry, low detail"
+    if occluder_text:
+        neg_extra += f", {occluder_text}"
 
-    print(f"\nRunning Flux-Fill on the cutout…")
-    t0 = time.time()
-    flux_results = test3_main._run_flux_fill_inpaint(
-        base_np=cutout_rgb,
-        inpaint_mask=hidden,
-        amodal_rgb_256=np.full((256, 256, 3), 255, dtype=np.uint8),
-        prompt=prompt,
-        n_samples=1,
-        out_dir=test_dir,
-        prefix="flux_completed",
-        neg_extra=neg_extra,
-        seed_offset=0,
-        strength=1.0,
-    )
-    dt = time.time() - t0
-    print(f"  Flux done in {dt:.1f}s")
+    # ── Agent 2 (Flux-Fill) + Agent 3 (reviewer/retry loop) ──────────────
+    use_reviewer = getattr(config, "USE_REVIEWER", False)
+    score_thresh = getattr(config, "REVIEWER_SCORE_THRESHOLD", 7.0)
+    max_retries  = getattr(config, "REVIEWER_MAX_RETRIES", 0) if use_reviewer else 0
 
-    if not flux_results:
-        print("Flux returned nothing — aborting")
-        return 1
+    current_prompt    = prompt
+    current_neg_extra = neg_extra
+    review_log        = []
+    flux_bgr = flux_rgb = None
 
-    flux_rgb = np.array(flux_results[0].convert("RGB"))
-    if flux_rgb.shape[:2] != (h, w):
-        flux_rgb = cv2.resize(flux_rgb, (w, h), interpolation=cv2.INTER_LANCZOS4)
-    flux_bgr = cv2.cvtColor(flux_rgb, cv2.COLOR_RGB2BGR)
-    # Restore visible-person pixels (Flux's VAE drift can soften them)
-    flux_bgr[vis_b == 1] = img_bgr[vis_b == 1]
+    for attempt in range(1, max_retries + 2):
+        print(f"\nRunning Flux-Fill on the cutout (attempt {attempt}/{max_retries + 1})…")
+        t0 = time.time()
+        flux_results = test3_main._run_flux_fill_inpaint(
+            base_np=cutout_rgb,
+            inpaint_mask=hidden,
+            amodal_rgb_256=np.full((256, 256, 3), 255, dtype=np.uint8),
+            prompt=current_prompt,
+            n_samples=1,
+            out_dir=test_dir,
+            prefix=f"flux_completed_attempt{attempt}",
+            neg_extra=current_neg_extra,
+            seed_offset=(attempt - 1) * 7,
+            strength=1.0,
+        )
+        dt = time.time() - t0
+        print(f"  Flux done in {dt:.1f}s")
+
+        if not flux_results:
+            print("Flux returned nothing — aborting")
+            return 1
+
+        cand_rgb = np.array(flux_results[0].convert("RGB"))
+        if cand_rgb.shape[:2] != (h, w):
+            cand_rgb = cv2.resize(cand_rgb, (w, h), interpolation=cv2.INTER_LANCZOS4)
+        cand_bgr = cv2.cvtColor(cand_rgb, cv2.COLOR_RGB2BGR)
+        # Restore visible-person pixels (Flux's VAE drift can soften them)
+        cand_bgr[vis_b == 1] = img_bgr[vis_b == 1]
+
+        if not use_reviewer:
+            flux_bgr, flux_rgb = cand_bgr, cand_rgb
+            break
+
+        cand_path = test_dir / f"flux_completed_attempt{attempt}_review.png"
+        cv2.imwrite(str(cand_path), cand_bgr)
+
+        review_prompt = (
+            f"You are reviewing an AI-completed image. The original photo (first image) "
+            f"shows a '{subject_text}' partly hidden behind "
+            f"{('a ' + occluder_text) if occluder_text else 'another object'}. The second "
+            f"image is the completed result, where the hidden region has been filled in by "
+            f"a diffusion model.\n\n"
+            f"Score the result 1-10 on: (a) whether the completed region shows the "
+            f"{subject_text}'s OWN body continuing naturally — NOT "
+            f"{occluder_text or 'the occluder'} regenerated in that space, and NOT a "
+            f"duplicate {subject_text}; (b) anatomical correctness; (c) seamless lighting/"
+            f"texture/color match with the visible portion; (d) absence of blur or "
+            f"visible seams.\n"
+            f"failure_code must be one of: ACCEPTED, OCCLUDER_REGENERATED, "
+            f"DUPLICATE_SUBJECT, ANATOMY_WRONG, BLURRY_OUTPUT, SEAM_VISIBLE.\n"
+            f"If score < {score_thresh}, also fill improved_prompt and "
+            f"improved_negative_prompt with a corrected version of this prompt: "
+            f"{current_prompt!r} (negative terms: {current_neg_extra!r}) that fixes the "
+            f"specific problem you found."
+        )
+        try:
+            review = test3_main.gpt_vision(
+                images=[str(img_path), str(cand_path)],
+                prompt=review_prompt,
+                schema=test3_main.REVIEWER_SCHEMA,
+                cache_key="agent3_reviewer",
+            )
+        except Exception as exc:
+            print(f"  [Agent 3: Reviewer] call failed ({exc!r}) — accepting attempt as-is")
+            flux_bgr, flux_rgb = cand_bgr, cand_rgb
+            break
+
+        score = review.get("score", 0)
+        failure_code = review.get("failure_code", "")
+        print(f"  [Agent 3: Reviewer] score={score}/10  failure_code={failure_code}")
+        print(f"  Feedback: {review.get('feedback', '')[:200]}")
+        review_log.append({"attempt": attempt, **review})
+
+        if score >= score_thresh or attempt >= max_retries + 1:
+            flux_bgr, flux_rgb = cand_bgr, cand_rgb
+            break
+
+        print(f"  [Agent 3: Reviewer] score below threshold ({score_thresh}) — retrying")
+        if review.get("improved_prompt"):
+            current_prompt = review["improved_prompt"]
+        if review.get("improved_negative_prompt"):
+            current_neg_extra = review["improved_negative_prompt"]
+
+    if review_log:
+        with open(test_dir / "review_log.json", "w") as f:
+            json.dump(review_log, f, indent=2)
     # ── Re-segment Flux's output to capture the FULL generated silhouette ─
     # Jiang Ao approach (amodal/main.py:517 filter_out_amodal_segmentation):
     # take ALL SAM3 mask candidates and pick the one with the highest
@@ -397,6 +502,9 @@ def main() -> int:
     current_mask  = final_mask.copy()
     sides_touched = _check_touch_boundary(current_mask)
     print(f"\n[OffFrame] sides touched after in-frame Flux: {sides_touched or 'none'}")
+    if sides_touched and not getattr(config, "USE_OFFFRAME_EXTENSION", True):
+        print("[OffFrame] disabled via config.USE_OFFFRAME_EXTENSION — skipping")
+        sides_touched = set()
 
     iter_canvases   = []   # (label, bgr) tuples for comparison
     iter_canvases.append(("OF0: in-frame Flux", current_bgr.copy()))
@@ -438,7 +546,7 @@ def main() -> int:
             f"Photorealistic complete {subject_text}, {dir_clause}. "
             f"Natural anatomy and form continuing seamlessly from the "
             f"visible body, with matching lighting, texture and color. "
-            f"Sharp focus, high detail. Plain neutral background."
+            f"Sharp focus, high detail. Plain neutral background.{occluder_clause}"
         )
 
         t1 = time.time()
@@ -569,13 +677,14 @@ def main() -> int:
         labels=[
             "A: original",
             "B: green=visible, magenta=hidden",
-            "C: person cutout (Flux input)",
+            f"C: {subject_text} cutout (Flux input)",
             "D: hidden inpaint mask",
-            "E: Flux-completed person",
+            f"E: Flux-completed {subject_text}",
         ],
         out_path=test_dir / "comparison.png",
     )
 
+    _publish_final(test_dir, test_dir / "offframe_final_rgba.png", subject_slug)
     print(f"\nOutputs → {test_dir}/")
     return 0
 

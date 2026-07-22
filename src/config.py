@@ -4,7 +4,7 @@ IMAGE_PATH = "/home/basil-k-aji/Desktop/Workspace/RD/website/animal-8518802_640_
 # Optional hint telling Agent 1 what the occluded subject is (e.g. "horse").
 # Default is empty — Agent 1 auto-detects the occluded object itself from
 # the image. Only set this when you want to steer detection explicitly.
-INPUT_PROMPT = "rabbit"
+INPUT_PROMPT = "horse"
 
 # Iterative off-frame canvas-extension loop (pad + outpaint when the subject
 # touches a frame edge). Disabled for now — focus on getting the occluded-
@@ -53,22 +53,9 @@ GPU_MEMORY_LIMIT_GB = 44.0
 # Mixed-Context-Diffusion-Sampling path and the ControlNet cascade, both
 # permanently disabled/removed).
 
-# ── ControlNet-Inpaint (shape-prior guided completion) ────────────────────────
-# pip install diffusers transformers accelerate xformers
-# ── Inpainter backend selector ────────────────────────────────────────────────
-# "controlnet_sd15" — ControlNet-Inpaint v1.1 + SD 1.5-inpaint base.
-#                     Lightweight (~6GB VRAM), weaker anatomy priors. Not used
-#                     directly any more — kept only as _run_flux_fill_inpaint's
-#                     load-failure fallback.
-# "flux_fill"       — FLUX.1-Fill-dev.  Much stronger anatomy / texture
-#                     priors.  Requires ~16-24 GB VRAM and the model
-#                     checkpoint (`black-forest-labs/FLUX.1-Fill-dev`).
-#                     Memory mode is `enable_model_cpu_offload` so it fits
-#                     in ~12 GB.  This is the ONLY live inpainting backend.
-# "sd3_inpaint"     — placeholder for SD3-Inpaint; not implemented yet.
-INPAINT_BACKEND            = "flux_fill"         # MINIMAL pipeline: Flux-Fill only (ControlNet+SD-1.5 OFF)
-
-# ── Flux-Fill specific config (only used when INPAINT_BACKEND="flux_fill") ────
+# ── ControlNet-Inpaint fallback was removed — FLUX.1-Fill-dev is the only
+# inpainting backend and always will be; there is no fallback path.
+# ── Flux-Fill specific config ─────────────────────────────────────────────────
 FLUX_FILL_MODEL_ID         = "black-forest-labs/FLUX.1-Fill-dev"
 FLUX_FILL_STEPS            = 30
 FLUX_FILL_GUIDANCE_SCALE   = 45.0    # Flux uses high CFG (10-50 range); higher = sharper detail
@@ -121,33 +108,10 @@ USE_EXTENSION_BBOX         = False    # v8 narrowing broke Flux denoising for th
 EXTENSION_MULTIPLIER       = 2.0      # kept for future experimentation
 MIN_EXTENSION_PX           = 100      # kept for future experimentation
 
-# CONTROLNET_MODEL_ID / SD_INPAINT_* below are only used by the ControlNet
-# fallback path in _run_controlnet_inpaint (fires if FluxFillPipeline fails
-# to load) — not part of the live inpainting path.
-CONTROLNET_MODEL_ID        = "lllyasviel/control_v11p_sd15_inpaint"
-SD_INPAINT_MODEL_ID        = "runwayml/stable-diffusion-inpainting"
-SD_INPAINT_STEPS           = 50      # DDIM steps for SD inpainting (raised from 30
-                                     # → 50 for finer detail in small completion
-                                     # regions like a shoulder/arm strip)
-SD_INPAINT_GUIDANCE_SCALE  = 7.5     # CFG scale
-CONTROLNET_CONDITIONING_SCALE = 1.4  # ControlNet weight; raised from 1.0 to force the
-                                     # shape prior to dominate over the
-                                     # native UNet's bias toward the original (occluder)
-                                     # pixels still in the inpaint region.
-SD_INPAINT_STRENGTH        = 1.0     # full repaint of the masked region — no retention
-                                     # of original (horse/leaf/etc) latent, otherwise
-                                     # the occluder leaks into the result.
-
 # Mixed Context Diffusion Sampling (Xu et al., CVPR 2024) was removed —
 # permanently disabled via USE_MIXED_CONTEXT=False, and its ControlNet→Flux
 # refinement cascade via USE_FLUX_REFINEMENT=False. See mixed_context.py in
 # git history for the original implementation.
-
-# ── Shape prior threshold ─────────────────────────────────────────────────────
-# Used by the (fallback-only) ControlNet path's control-image compositing:
-# the shape-prior hint is a white-background RGB; pixels below this
-# brightness are treated as "object".
-SHAPE_PRIOR_THRESH = 240   # per-channel min; pixel is "object" if any channel < thresh
 
 # ── Mask dilation ─────────────────────────────────────────────────────────────
 MASK_EXPAND = 20    # px for elliptical dilation of the occluder mask
@@ -157,10 +121,10 @@ MASK_EXPAND = 20    # px for elliptical dilation of the occluder mask
 # USE_CLIP_GRID_FALLBACK / USE_GROUNDING_DINO = False — PSALM/InstaFormer
 # dominated mask fusion every run, so none of these ever changed an outcome).
 
-# The reviewer/retry agent (score threshold, retry counts, geometry
-# self-check thresholds, structured failure-code taxonomy) was removed along
-# with `inpainting_agent`/`reviewer`/`route`/`build_graph` in main.py — none
-# of it is reachable from the live entry point. See git history if reviving.
+# The old LangGraph-based reviewer/retry agent (`inpainting_agent`/`reviewer`/
+# `route`/`build_graph` in the pre-restructure main.py) was removed; its
+# scoring/retry behavior lives on as the inline Agent 3 loop in
+# src/pipeline.py, gated by USE_REVIEWER above.
 
 # ── AISFormer feature extraction (SAM3 backbone) ──────────────────────────────
 # AISFORMER_ENABLED = True → SAM3 image features are extracted and saved to

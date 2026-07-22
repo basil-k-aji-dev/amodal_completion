@@ -79,7 +79,7 @@ Designed and tested on:
 
 Per Flux pass: ~9–12 s/step × 50 steps ≈ 7–10 min. Typical run with 1–2 off-frame iters: 15–25 min wall-clock. GPU is PCIe-bound, not compute-bound — Flux is 24 GB in bf16 and must stream through `enable_model_cpu_offload` on this hardware. On 24 GB+ cards Flux runs fully on device and this drops to a couple minutes per pass.
 
-Quality-neutral Ampere perf flags (`cudnn.benchmark`, TF32 matmul, VAE tiling/slicing) are enabled in `main.py`.
+Quality-neutral Ampere perf flags (`cudnn.benchmark`, TF32 matmul, VAE tiling/slicing) are enabled in `src/pipeline.py`.
 
 ## Setup
 
@@ -89,23 +89,24 @@ Quality-neutral Ampere perf flags (`cudnn.benchmark`, TF32 matmul, VAE tiling/sl
 uv sync
 ```
 
-Requires Python 3.10+. Key deps: `torch`, `diffusers>=0.31`, `transformers`, `openai`, `langgraph`, `python-dotenv`.
+Requires Python 3.10+. Key deps: `torch`, `diffusers>=0.31`, `transformers`, `openai`, `python-dotenv`.
 
-### External dependency: InstaOrder
+### External dependency: InstaOrder / InstaFormer
 
-The pipeline calls into the InstaOrder repo (POSTECH-CVLab) for same-class occluder ranking. Clone it and download the checkpoint:
+The pipeline calls into InstaFormer (SNU-VGILab), a fork of InstaOrder (POSTECH-CVLab), for occlusion+depth-order ranking. It runs as a subprocess in its own isolated venv (`.instaformer-venv/`, Python 3.8 + Detectron2 + torch 2.1.0/cu118 — incompatible with this project's own environment). Clone it and download the checkpoint:
 
 ```bash
-# Adjust paths in config.py to match
-git clone https://github.com/POSTECH-CVLab/InstaOrder ../InstaOrder
-# Download InstaOrder_InstaOrderNet_od.pth.tar into InstaOrder/InstaOrder_ckpt/
+# Adjust paths in src/config.py to match
+git clone https://github.com/SNU-VGILab/InstaFormer InstaFormer
+# Download the InstaFormer occlusion+depth-order checkpoint into InstaFormer/checkpoints/
 ```
 
-Then edit `config.py`:
+Then edit `src/config.py`:
 
 ```python
-INSTAORDER_REPO_DIR = "/abs/path/to/InstaOrder"
-INSTAORDER_CKPT     = "/abs/path/to/InstaOrder/InstaOrder_ckpt/InstaOrder_InstaOrderNet_od.pth.tar"
+INSTAFORMER_REPO_DIR    = "/abs/path/to/InstaFormer"
+INSTAFORMER_VENV_PYTHON = "/abs/path/to/.instaformer-venv/bin/python"
+INSTAFORMER_CKPT        = "/abs/path/to/InstaFormer/checkpoints/instaformer_od_swinl_200.pth"
 ```
 
 ### Environment variables
@@ -121,20 +122,33 @@ All other models (SAM3, Flux-Fill, Depth-Anything) auto-download to your Hugging
 
 ## Running
 
-Set the target image and class in `config.py`:
-
-```python
-IMAGE_PATH = "/path/to/photo.jpg"
-TARGET     = "rabbit"   # or pigeon, blackbird, sheep, etc.
-```
-
-Then:
+Single image:
 
 ```bash
-.venv/bin/python test_flux_cutout_person.py
+.venv/bin/python src/pipeline.py /path/to/photo.jpg [prompt]
 ```
 
-Outputs land in `output/<image-stem>/_flux_cutout_person/`:
+`image_path` defaults to `DEFAULT_IMAGE` in `src/pipeline.py` if omitted. The
+optional `prompt` argument overrides `config.INPUT_PROMPT` for just that run
+(hints Agent 1 what the occluded subject is, e.g. `"rabbit"`); leave it out
+to let Agent 1 auto-detect.
+
+Single image or a whole directory, via the common test runner:
+
+```bash
+.venv/bin/python test_pipeline.py /path/to/photo.jpg [prompt]
+.venv/bin/python test_pipeline.py /path/to/image_dir/
+```
+
+In directory mode every `.jpg`/`.jpeg`/`.png` inside is run in turn (each as
+its own subprocess, to keep GPU memory clean between images); the prompt hint
+per image defaults to the filename's trailing `_<class>` suffix (e.g.
+`horse-123_640_horse.jpg` → `horse`).
+
+`run_batch.sh` / `run_batch_20.sh` are the curated large-batch runners used
+against the full dataset in `website/data/`.
+
+Outputs land in `output/<image-stem>/_flux_cutout_<subject>/`:
 
 - `flux_completed_rgba.png` — alpha-blended cutout (feathered edges)
 - `flux_completed_white_bg.png` — same subject on white background
@@ -144,17 +158,18 @@ Outputs land in `output/<image-stem>/_flux_cutout_person/`:
 
 ## Key config flags
 
-All in `config.py`. Currently-validated defaults:
+All in `src/config.py`. Currently-validated defaults:
 
 | Flag | Value | Notes |
 |---|---|---|
 | `INPAINT_BACKEND` | `flux_fill` | Flux is the only validated backend |
 | `USE_AMODAL_COMPLETION` | `False` | Skip GPT polygon, let Flux+SAM3 decide silhouette |
-| `USE_PIX2GESTALT_AMODAL` | `False` | pix2gestalt review path disabled |
-| `USE_PSALM` | `False` | over-segmented nature scenes |
-| `USE_INSTAORDER` | `True` | InstaOrder is the only useful occluder-ranking signal here |
-| `USE_DEPTH_RANK` | `True` | corroborates InstaOrder on same-class occluders |
-| `FLUX_FILL_CPU_OFFLOAD` | `False` | Flux runs fully on device; disable on <24 GB cards |
+| `USE_INSTAFORMER` | `True` | InstaFormer is the occluder/depth-order ranking signal (via subprocess) |
+| `USE_REVIEWER` | `True` | Agent 3 — GPT-vision reviewer scores each Flux completion and retries on a low score |
+| `REVIEWER_SCORE_THRESHOLD` | `7.0` | score ≥ this = accepted, stop retrying |
+| `REVIEWER_MAX_RETRIES` | `2` | extra Flux attempts beyond the first if the reviewer rejects |
+| `USE_OFFFRAME_EXTENSION` | `False` | iterative off-frame canvas extension; disabled while in-frame quality is being tuned |
+| `FLUX_FILL_CPU_OFFLOAD` | `False` | Flux runs fully on device; enable on <24 GB cards |
 | `GPU_MEMORY_LIMIT_GB` | `44.0` | hard cap, leaves OS headroom (tuned for a 48 GB card) |
 
 ## What's intentionally not in this repo
@@ -163,15 +178,14 @@ Disabled / experimental code paths from upstream that were not part of the worki
 
 - PSALM referring-expression seg
 - pix2gestalt amodal review
-- AISFormer head
-- ControlNet-SD-1.5 inpaint backend
+- AISFormer head (inference path — flag plumbing for feature extraction remains)
+- ControlNet-SD-1.5 inpaint backend — fully removed, no fallback; FLUX.1-Fill-dev is the only inpainting backend
 - Mixed-Context Diffusion Sampling
 - CLIP-grounded occluder discovery
 - Grounding DINO occluder fallback
 - mmgp / group offload / disk offload (tested, didn't beat sequential)
-- Reviewer (Agent 3) + retry loop
 
-The flag plumbing for these still exists in `config.py` and `main.py` so they can be re-enabled, but no vendored model dirs are bundled.
+The flag plumbing for these still exists in `src/config.py` so they can be re-enabled, but no vendored model dirs are bundled.
 
 ## Credits
 

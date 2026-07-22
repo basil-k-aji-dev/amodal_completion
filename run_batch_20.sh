@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs test_flux_cutout_person.py over: bunny first, then 20 selected
-# COCO-category candidates (cats, dogs, cows, sheep, giraffe, horse) chosen
-# to be likely-easy cases for the current InstaFormer + Flux setup.
+# Runs src/pipeline.py over: bunny first, then 20 selected COCO-category
+# candidates (cats, dogs, cows, sheep, giraffe, horse) chosen to be
+# likely-easy cases for the current InstaFormer + Flux setup.
 set -uo pipefail
 cd "$(dirname "$0")"
 
@@ -34,7 +34,7 @@ horse-1006570_640_horse.jpg
 
 # Wait for any currently-running pipeline invocation to finish first
 # (single GPU — avoid two Flux/SAM3 processes contending for VRAM).
-while pgrep -f "test_flux_cutout_person.py" > /dev/null; do
+while pgrep -f "src/pipeline.py" > /dev/null; do
   sleep 5
 done
 
@@ -45,15 +45,7 @@ for stem_jpg in $IMAGES; do
   echo "=================================================="
   echo "[$(date +%T)] Image: $f   INPUT_PROMPT=$target"
   echo "=================================================="
-  python - "$target" <<'PY'
-import re, sys, pathlib
-target = sys.argv[1]
-p = pathlib.Path("config.py")
-text = p.read_text()
-text = re.sub(r'^INPUT_PROMPT\s*=\s*".*"', f'INPUT_PROMPT = "{target}"', text, count=1, flags=re.M)
-p.write_text(text)
-PY
-  .venv/bin/python test_flux_cutout_person.py "$f" 2>&1 | tee "logs/${stem}.log"
+  .venv/bin/python src/pipeline.py "$f" "$target" 2>&1 | tee "logs/${stem}.log"
   status=${PIPESTATUS[0]}
   echo "[$(date +%T)] Exit status for $stem: $status"
 done

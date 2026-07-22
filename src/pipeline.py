@@ -1,19 +1,15 @@
-"""Test: pass ONLY the full-person region (gray everywhere else) to Flux-Fill
-and ask it to inpaint the occluded shoulder/torso slice.
-
-Logic:
-  1. Run Agent 1 (occlusion_agent) if masks aren't cached, to get
-     visible_mask + subject_full_amodal_mask.
-  2. Build the "person cutout": image[amodal_mask == 1] = original
-                                 image[amodal_mask == 0] = neutral gray
-  3. Build the inpaint mask: amodal_mask AND NOT visible_mask = the hidden
-     slice that was behind the horse.
-  4. Run Flux-Fill (image, inpaint_mask, "complete the person's torso").
-  5. Save: person_cutout.png, hidden_inpaint_mask.png, flux_completed.png,
-           comparison.png.
+"""Pipeline entry point: runs Agent 1 (occlusion_agent) if masks aren't
+cached, builds the Jiang-Ao-style hidden-region cutout, then runs Agent 2
+(FLUX.1-Fill-dev inpainting) through Agent 3 (a GPT-vision reviewer/retry
+loop that scores each completion and retries with a corrected prompt on a
+low score), and finally the iterative off-frame extension stage (kept in
+the codebase but disabled by default via config.USE_OFFFRAME_EXTENSION).
 
 Usage:
-    .venv/bin/python test_flux_cutout_person.py [image_path]
+    .venv/bin/python src/pipeline.py [image_path] [input_prompt]
+
+`input_prompt`, if given, overrides config.INPUT_PROMPT for this run only
+(lets batch runners hint Agent 1 per-image without editing config.py).
 """
 
 from __future__ import annotations
@@ -27,6 +23,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import config
+from runtime import BASE_DIR, gpt_vision
+from schemas import REVIEWER_SCHEMA
+from occlusion_agent import occlusion_agent
+from models.flux_fill import _run_flux_fill_inpaint
+from models.sam3 import _sam_segment_targeted
 
 
 DEFAULT_IMAGE = ("/home/basil-k-aji/Desktop/Workspace/RD/website/"
@@ -152,18 +157,15 @@ def main() -> int:
     if not img_path.exists():
         print(f"Image not found: {img_path}")
         return 1
+    if len(sys.argv) > 2 and sys.argv[2].strip():
+        config.INPUT_PROMPT = sys.argv[2].strip()
 
     stem = img_path.stem
-    # Defer heavy imports
-    sys.path.insert(0, str(Path(__file__).parent))
-    import main as test3_main           # noqa: E402
-    import config                       # noqa: E402
-
     input_prompt = (getattr(config, "INPUT_PROMPT", "") or "").strip()
     subject_text = input_prompt or "subject"
     subject_slug = re.sub(r"[^a-z0-9]+", "_", subject_text.lower()).strip("_") or "subject"
 
-    out_dir = test3_main.BASE_DIR / "output" / stem
+    out_dir = BASE_DIR / "output" / stem
     out_dir.mkdir(parents=True, exist_ok=True)
     test_dir = out_dir / f"_flux_cutout_{subject_slug}"
     test_dir.mkdir(parents=True, exist_ok=True)
@@ -209,7 +211,7 @@ def main() -> int:
             "best_score":            0.0,
         }
         t0 = time.time()
-        agent1_result = test3_main.occlusion_agent(state)
+        agent1_result = occlusion_agent(state)
         print(f"Agent 1 done in {time.time() - t0:.1f}s")
         if not input_prompt:
             detected = (agent1_result or {}).get("occluded_object", "").strip()
@@ -335,7 +337,7 @@ def main() -> int:
     for attempt in range(1, max_retries + 2):
         print(f"\nRunning Flux-Fill on the cutout (attempt {attempt}/{max_retries + 1})…")
         t0 = time.time()
-        flux_results = test3_main._run_flux_fill_inpaint(
+        flux_results = _run_flux_fill_inpaint(
             base_np=cutout_rgb,
             inpaint_mask=hidden,
             amodal_rgb_256=np.full((256, 256, 3), 255, dtype=np.uint8),
@@ -388,10 +390,10 @@ def main() -> int:
             f"specific problem you found."
         )
         try:
-            review = test3_main.gpt_vision(
+            review = gpt_vision(
                 images=[str(img_path), str(cand_path)],
                 prompt=review_prompt,
-                schema=test3_main.REVIEWER_SCHEMA,
+                schema=REVIEWER_SCHEMA,
                 cache_key="agent3_reviewer",
             )
         except Exception as exc:
@@ -432,7 +434,7 @@ def main() -> int:
             flux_raw_path = test_dir / "_flux_raw_for_segment.png"
             cv2.imwrite(str(flux_raw_path),
                         cv2.cvtColor(flux_rgb, cv2.COLOR_RGB2BGR))
-            sam_res = test3_main._sam_segment_targeted(
+            sam_res = _sam_segment_targeted(
                 str(flux_raw_path),
                 [{"label": "final_subject", "x": cx, "y": cy}],
                 test_dir,
@@ -550,7 +552,7 @@ def main() -> int:
         )
 
         t1 = time.time()
-        iter_results = test3_main._run_flux_fill_inpaint(
+        iter_results = _run_flux_fill_inpaint(
             base_np=cv2.cvtColor(padded_bgr, cv2.COLOR_BGR2RGB),
             inpaint_mask=outpaint_mask,
             amodal_rgb_256=np.full((256, 256, 3), 255, dtype=np.uint8),
@@ -583,7 +585,7 @@ def main() -> int:
             break
         cy = int(ys_in.mean()); cx = int(xs_in.mean())
         try:
-            sam_res = test3_main._sam_segment_targeted(
+            sam_res = _sam_segment_targeted(
                 str(canvas_path),
                 [{"label": f"offframe_iter{it}_subject", "x": cx, "y": cy}],
                 test_dir,

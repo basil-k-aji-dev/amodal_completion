@@ -20,7 +20,18 @@ REVIEWER_SCORE_THRESHOLD  = 7.0   # score >= this = accepted, stop retrying
 REVIEWER_MAX_RETRIES      = 2     # extra attempts beyond the first
 
 # ── GPT (loaded from .env: OPENAI_MODEL, OPENAI_API_KEY) ─────────────────────
-GPT_MAX_TOKENS = 10192
+# Passed to the Responses API as max_output_tokens (see runtime.py:gpt_vision
+# — previously defined here but never actually wired into the API call, so
+# this had zero effect no matter how high it was set; now it's real).
+# For a reasoning model with reasoning.effort="high", this budget covers
+# BOTH the internal reasoning tokens AND the final visible output — with a
+# low ceiling, "high" effort can burn the whole budget on reasoning and
+# leave nothing for the actual JSON response (the empty-response failure
+# this flag exists to prevent). It's a ceiling, not a target: the model
+# stops when it's done, so raising this costs nothing in the common case
+# and only matters for the tail case where reasoning legitimately needs
+# more room — kept generous accordingly.
+GPT_MAX_TOKENS = 32000
 
 # ── SAM3 automatic segmentation ───────────────────────────────────────────────
 SAM3_MODEL_ID        = "facebook/sam3"
@@ -58,7 +69,12 @@ GPU_MEMORY_LIMIT_GB = 44.0
 # ── Flux-Fill specific config ─────────────────────────────────────────────────
 FLUX_FILL_MODEL_ID         = "black-forest-labs/FLUX.1-Fill-dev"
 FLUX_FILL_STEPS            = 30
-FLUX_FILL_GUIDANCE_SCALE   = 45.0    # Flux uses high CFG (10-50 range); higher = sharper detail
+FLUX_FILL_GUIDANCE_SCALE   = 30.0    # BFL's own documented default/example for FLUX.1-Fill-dev
+                                     # specifically (diffusers pipeline_flux_fill.py's `guidance_scale`
+                                     # default + EXAMPLE_DOC_STRING both use 30). Was 45.0 — above the
+                                     # tool's own recommended value with no evidence it helped; the
+                                     # DUPLICATE_SUBJECT/background-replacement failures that motivated
+                                     # raising it were traced to the prompt wording, not guidance scale.
 FLUX_FILL_MAX_SEQUENCE_LEN = 512
 FLUX_FILL_CPU_OFFLOAD      = False   # enable_model_cpu_offload — ~10 GB peak; not needed on 48 GB cards
 # Disk-offload + low-cpu-mem experiment (disabled — kept the code paths in
@@ -107,6 +123,20 @@ USE_EXTENSION_BBOX         = False    # v8 narrowing broke Flux denoising for th
                                        # v7 (full L-shape) produced better tight-cropped results.
 EXTENSION_MULTIPLIER       = 2.0      # kept for future experimentation
 MIN_EXTENSION_PX           = 100      # kept for future experimentation
+
+# ── Bound the IN-FRAME hidden (inpaint) region to the subject's plausible
+# extent ─────────────────────────────────────────────────────────────────
+# Unrelated to USE_EXTENSION_BBOX above (that one narrows the OFF-FRAME
+# padded-canvas mask). This one clips `hidden = dilate(occluder) − visible`
+# (src/pipeline.py) to an expanded visible-subject bbox. Needed because a
+# large occluder (e.g. a snowbank a rabbit sits behind) otherwise makes
+# `hidden` the ENTIRE occluder — observed at 6-7x the visible subject's
+# area — which Flux then "fills" with multiple/oversized subjects instead
+# of one plausible continuation. A compact occluder (already close to
+# subject-sized, e.g. a person) is barely affected by this clip.
+BOUND_HIDDEN_TO_SUBJECT_BBOX  = True
+HIDDEN_REGION_BBOX_MULTIPLIER = 2.0   # expand visible bbox by this factor about its center
+HIDDEN_REGION_MIN_EXPANSION_PX = 100  # floor on the expansion in px per side
 
 # Mixed Context Diffusion Sampling (Xu et al., CVPR 2024) was removed —
 # permanently disabled via USE_MIXED_CONTEXT=False, and its ControlNet→Flux

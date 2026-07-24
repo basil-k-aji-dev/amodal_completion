@@ -95,7 +95,7 @@ def _get_flux_fill_pipe():
             pipe.enable_group_offload(**go_kwargs)
             mode = (f"group_offload(blocks={n_blocks}, stream={use_stream}"
                     f"{', disk=' + disk_path if disk_path else ''})")
-        elif getattr(config, "FLUX_FILL_CPU_OFFLOAD", True):
+        elif getattr(config, "FLUX_FILL_CPU_OFFLOAD", False):
             pipe.enable_model_cpu_offload()
             mode = "model_cpu_offload"
         else:
@@ -151,6 +151,7 @@ def _run_flux_fill_inpaint(
     neg_extra: str = "",
     seed_offset: int = 0,
     strength: float = 1.0,    # 1.0 = full re-inpaint; 0.4-0.7 = refinement pass
+    keep_loaded: bool = False,  # skip the post-call GPU release (see below)
 ) -> list:
     """Run FLUX.1-Fill-dev on the inpaint region.
 
@@ -158,6 +159,16 @@ def _run_flux_fill_inpaint(
     in one shot — no shape-prior conditioning image, no UNet hooks. Anatomy
     quality comes from the model's native priors (DiT, 12B params) rather
     than from external scaffolding.
+
+    `keep_loaded=True` skips freeing the pipeline from GPU after this call.
+    Loading/releasing a 12B-param model is the dominant cost of a call (the
+    30-step generation itself takes seconds; the load+release teardown
+    around it takes ~100s+) — that overhead is only necessary right before
+    something else (SAM3, InstaFormer) needs the GPU next. A caller making
+    several back-to-back Flux calls with nothing else touching the GPU in
+    between (e.g. the reviewer retry loop) should pass `keep_loaded=True`
+    on every call and free the pipeline itself once, via `_free_flux_fill`,
+    when it's actually done — see pipeline.py's retry loop.
     """
     from PIL import Image as PILImage
 
@@ -184,9 +195,41 @@ def _run_flux_fill_inpaint(
     if neg_extra:
         flux_prompt = f"{prompt}.  Avoid: {neg_extra}."
 
+    # FluxFillPipeline has two text encoders: CLIP (pooled embedding, hard
+    # 77-token cap) and T5 (sequence embedding, up to max_sequence_length).
+    # If `prompt_2` isn't given it defaults to `prompt`, so CLIP silently
+    # truncates whatever we pass as `prompt` — observed in practice eating
+    # the tail of the merged prompt+"Avoid:" clause (and any long
+    # reviewer-improved retry prompt) right where the corrective
+    # instructions live. Keep CLIP's copy short and front-loaded with the
+    # core instruction; let T5's `prompt_2` carry the full text.
+    clip_prompt = " ".join(flux_prompt.split()[:45])
+
+    # T5's max_sequence_length (config.FLUX_FILL_MAX_SEQUENCE_LEN, e.g. 512)
+    # is a real ceiling, but every padding token past the prompt's actual
+    # length still costs attention compute on every diffusion step.
+    # Hardcoding one smaller fixed value would risk silently truncating a
+    # long reviewer-improved retry prompt — the same failure mode just
+    # fixed for CLIP above, at a higher token budget. Instead, measure
+    # THIS prompt's real token count with T5's own tokenizer and pick the
+    # smallest safe bucket that fits it; a long prompt automatically gets
+    # bumped up to whatever it actually needs, up to the configured
+    # ceiling — it never gets truncated.
+    configured_max = int(getattr(config, "FLUX_FILL_MAX_SEQUENCE_LEN", 512))
+    try:
+        n_tokens = len(pipe.tokenizer_2(flux_prompt, truncation=False)["input_ids"])
+    except Exception:
+        n_tokens = len(flux_prompt.split()) * 2   # generous fallback if tokenizer_2 is unavailable
+    max_seq_len = configured_max
+    for bucket in (64, 128, 192, 256, 384):
+        if bucket <= configured_max and n_tokens + 8 <= bucket:
+            max_seq_len = bucket
+            break
+
     print(f"  [Flux-Fill] Generating {n_samples} samples "
           f"(steps={config.FLUX_FILL_STEPS}, guidance={config.FLUX_FILL_GUIDANCE_SCALE}, "
-          f"strength={strength}, {flux_w}×{flux_h}, seed_offset={seed_offset})…")
+          f"strength={strength}, {flux_w}×{flux_h}, seed_offset={seed_offset}, "
+          f"max_seq_len={max_seq_len}/{configured_max} [{n_tokens} tokens])…")
     print(f"  Prompt: {flux_prompt[:140]}")
 
     results = []
@@ -195,14 +238,15 @@ def _run_flux_fill_inpaint(
             seed = 42 + seed_offset * 1000 + i
             generator = torch.Generator(device="cpu").manual_seed(seed)
             call_kwargs = dict(
-                prompt=flux_prompt,
+                prompt=clip_prompt,
+                prompt_2=flux_prompt,
                 image=pil_base,
                 mask_image=pil_mask,
                 height=flux_h,
                 width=flux_w,
                 num_inference_steps=config.FLUX_FILL_STEPS,
                 guidance_scale=config.FLUX_FILL_GUIDANCE_SCALE,
-                max_sequence_length=config.FLUX_FILL_MAX_SEQUENCE_LEN,
+                max_sequence_length=max_seq_len,
                 generator=generator,
             )
             # FluxFillPipeline supports `strength` (img2img-like partial denoise)
@@ -225,7 +269,8 @@ def _run_flux_fill_inpaint(
             out.save(str(save_path))
             results.append(out)
     finally:
-        _free_flux_fill()
+        if not keep_loaded:
+            _free_flux_fill()
     return results
 
 

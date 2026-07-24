@@ -30,7 +30,7 @@ import config
 from runtime import BASE_DIR, gpt_vision
 from schemas import REVIEWER_SCHEMA
 from occlusion_agent import occlusion_agent
-from models.flux_fill import _run_flux_fill_inpaint
+from models.flux_fill import _run_flux_fill_inpaint, _free_flux_fill
 from models.sam3 import _sam_segment_targeted
 
 
@@ -152,6 +152,48 @@ def _publish_final(test_dir: Path, rgba_src: Path, subject_slug: str) -> None:
         shutil.copy2(comparison_src, final_dir / "comparison.png")
 
 
+def _apply_occlusion_info(info: dict, subject_text: str, input_prompt: str,
+                           source: str) -> tuple:
+    """Extract occluder_text (and subject_text, when no explicit input
+    prompt was given) from an Agent-1 result — either freshly returned by
+    occlusion_agent() or loaded from a cached occlusion.json written by an
+    earlier run. Both share the same 'occluder'/'occluded_object' keys, so
+    a cache hit gets the exact same occluder-exclusion prompt clause a
+    fresh Agent 1 run would produce, instead of silently losing it.
+    """
+    occluder_text = (info.get("occluder", "") or "").strip()
+    if occluder_text:
+        print(f"  Occluder identified as '{occluder_text}' ({source}) — will "
+              f"be explicitly excluded from the Flux prompt")
+    if not input_prompt:
+        detected = (info.get("occluded_object", "") or "").strip()
+        if detected:
+            subject_text = detected
+            print(f"  No input prompt given — using {source} detection for "
+                  f"the completion prompt: '{subject_text}'")
+    return subject_text, occluder_text
+
+
+def _mask_covers_majority_of_frame(mask_path: Path, h: int, w: int,
+                                    max_fraction: float = 0.55) -> bool:
+    """True if `mask_path` is missing/unreadable, or covers more than
+    `max_fraction` of the frame. A single subject's visible-mask should
+    never be the majority of the frame — seen in practice, a stale/corrupt
+    Agent 1 cache can save visible_mask.png with foreground and background
+    swapped (e.g. the wall gets marked "visible", not the animal), which
+    then silently poisons every downstream mask (hidden region, PostSeg
+    argmax-IoU, the final gray-fill). Used both to invalidate a cached
+    mask before trusting it and, as a last resort, to auto-flip one that's
+    still implausible after a fresh Agent 1 run.
+    """
+    raw = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if raw is None:
+        return True
+    if raw.shape != (h, w):
+        raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_NEAREST)
+    return int((raw > 127).sum()) > max_fraction * h * w
+
+
 def main() -> int:
     img_path = Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMAGE)
     if not img_path.exists():
@@ -171,10 +213,17 @@ def main() -> int:
     test_dir.mkdir(parents=True, exist_ok=True)
     print(f"Out dir: {test_dir}")
 
+    img_bgr = cv2.imread(str(img_path))
+    h, w = img_bgr.shape[:2]
+
     # ── Step 1: ensure we have visible + amodal masks ────────────────────
     vis_path     = out_dir / "visible_mask.png"
     amodal_path  = out_dir / "subject_full_amodal_mask.png"
     need_agent1 = not (vis_path.exists() and amodal_path.exists())
+    if not need_agent1 and _mask_covers_majority_of_frame(vis_path, h, w):
+        print("  [WARN] cached visible_mask.png covers most of the frame — "
+              "looks inverted/stale; forcing Agent 1 to re-run")
+        need_agent1 = True
     if need_agent1:
         print(f"Masks missing — running Agent 1 (occlusion_agent)…")
         config.IMAGE_PATH = str(img_path)
@@ -213,23 +262,21 @@ def main() -> int:
         t0 = time.time()
         agent1_result = occlusion_agent(state)
         print(f"Agent 1 done in {time.time() - t0:.1f}s")
-        if not input_prompt:
-            detected = (agent1_result or {}).get("occluded_object", "").strip()
-            if detected:
-                subject_text = detected
-                print(f"  No input prompt given — using Agent 1's own "
-                      f"detection for the completion prompt: '{subject_text}'")
-        occluder_text = (agent1_result or {}).get("occluder", "").strip()
-        if occluder_text:
-            print(f"  Occluder identified as '{occluder_text}' — will be "
-                  f"explicitly excluded from the Flux prompt")
+        subject_text, occluder_text = _apply_occlusion_info(
+            agent1_result or {}, subject_text, input_prompt, "Agent 1's own")
     else:
         print(f"Reusing cached masks from {out_dir}/")
-        occluder_text = ""
+        cached_occlusion = {}
+        occlusion_json_path = out_dir / "occlusion.json"
+        if occlusion_json_path.exists():
+            try:
+                cached_occlusion = json.loads(occlusion_json_path.read_text())
+            except Exception as exc:
+                print(f"  [WARN] failed to read cached occlusion.json: {exc!r}")
+        subject_text, occluder_text = _apply_occlusion_info(
+            cached_occlusion, subject_text, input_prompt, "cached occlusion.json")
 
-    # ── Step 2: load image + masks ───────────────────────────────────────
-    img_bgr = cv2.imread(str(img_path))
-    h, w = img_bgr.shape[:2]
+    # ── Step 2: load masks ────────────────────────────────────────────────
     vis_mask = cv2.imread(str(vis_path), cv2.IMREAD_GRAYSCALE)
     am_mask  = cv2.imread(str(amodal_path), cv2.IMREAD_GRAYSCALE)
     if vis_mask.shape != (h, w):
@@ -238,6 +285,16 @@ def main() -> int:
         am_mask  = cv2.resize(am_mask,  (w, h), interpolation=cv2.INTER_NEAREST)
     vis_b = (vis_mask > 127).astype(np.uint8)
     am_b  = (am_mask  > 127).astype(np.uint8)
+    if int(vis_b.sum()) > 0.55 * h * w:
+        print("  [WARN] visible_mask still covers most of the frame after "
+              "Agent 1 — flipping foreground/background polarity")
+        vis_b = 1 - vis_b
+        # Persist the correction. Without this, every future run re-reads
+        # the same still-inverted file on disk, re-trips this exact check,
+        # and re-triggers a full Agent 1 re-run every single time — the
+        # cache never sticks for this image.
+        cv2.imwrite(str(vis_path), vis_b * 255)
+        cv2.imwrite(str(amodal_path), vis_b * 255)
     print(f"  visible mask: {int(vis_b.sum())} px")
     print(f"  amodal  mask: {int(am_b.sum())} px")
 
@@ -261,11 +318,42 @@ def main() -> int:
     JA_ITERS  = 3
     occ_dilated = cv2.dilate(occ_b, JA_KERNEL, iterations=JA_ITERS).astype(np.uint8)
     hidden = (occ_dilated & (1 - vis_b)).astype(np.uint8)
-    am_b   = (vis_b | hidden).astype(np.uint8)   # used by off-frame boundary check below
     print(f"  visible: {int(vis_b.sum())} px   occluder: {int(occ_b.sum())} px   "
           f"occ_dilated: {int(occ_dilated.sum())} px")
     print(f"  hidden = dilate(occluder, 5x5, 3) \\ visible: {int(hidden.sum())} px  "
           f"(Jiang Ao iter-0 mask)")
+
+    # Bound the fill region to the subject's plausible extent. Unbounded,
+    # `hidden` is dilate(occluder) minus visible — fine for a COMPACT
+    # occluder (~subject-sized, e.g. a person standing in front of a
+    # horse), but for a large occluder (e.g. a snowbank a rabbit sits
+    # behind) that's the entire occluder: observed in practice at 6-7x the
+    # visible subject's area, up to 4 body-widths away from the subject.
+    # Flux then has no reason to paint one plausible continuation rather
+    # than several/oversized subjects tiling the space — which is exactly
+    # the DUPLICATE_SUBJECT failures the reviewer kept flagging. Clipping
+    # to an expanded visible-bbox is adaptive: a compact occluder is
+    # barely affected (it's already close to bbox-sized); a huge one gets
+    # clipped down to near the subject.
+    if getattr(config, "BOUND_HIDDEN_TO_SUBJECT_BBOX", True):
+        ys, xs = np.where(vis_b > 0)
+        if len(ys) > 0:
+            vx1, vy1, vx2, vy2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+            vw, vh = vx2 - vx1, vy2 - vy1
+            mult    = float(getattr(config, "HIDDEN_REGION_BBOX_MULTIPLIER", 2.0))
+            min_ext = int(getattr(config, "HIDDEN_REGION_MIN_EXPANSION_PX", 100))
+            ex = max(int(vw * (mult - 1) / 2), min_ext)
+            ey = max(int(vh * (mult - 1) / 2), min_ext)
+            bbox_mask = np.zeros((h, w), dtype=np.uint8)
+            bbox_mask[max(0, vy1 - ey):min(h, vy2 + ey),
+                      max(0, vx1 - ex):min(w, vx2 + ex)] = 1
+            hidden_before = int(hidden.sum())
+            hidden = (hidden & bbox_mask).astype(np.uint8)
+            if int(hidden.sum()) < hidden_before:
+                print(f"  [BoundHidden] expanded visible-bbox ({mult}x, min {min_ext}px) "
+                      f"clipped hidden region {hidden_before} → {int(hidden.sum())} px")
+
+    am_b = (vis_b | hidden).astype(np.uint8)   # used by off-frame boundary check below
 
     # CUTOUT: keep ONLY (eroded) visible person pixels.  Hidden slice +
     # everything else is neutral gray.  The 5×5 erosion (Jiang Ao
@@ -309,18 +397,32 @@ def main() -> int:
         return 0
 
     cutout_rgb = cv2.cvtColor(cutout, cv2.COLOR_BGR2RGB)
+    # NOTE on wording: this is a strict region-only inpaint, not a "generate
+    # a subject" prompt. Two failure modes showed up repeatedly at review
+    # time with an earlier, vaguer version of this prompt ("...full body...
+    # Plain neutral background."): the model would paint a second, separate
+    # animal (DUPLICATE_SUBJECT) or replace the surrounding scene wholesale
+    # (SEAM_VISIBLE / background regenerated) instead of a small, local
+    # continuation of the one existing subject. Every clause below exists
+    # to rule out one of those specific failures — keep them explicit
+    # rather than trimming back to something vaguer.
     occluder_clause = (
-        f" Do NOT draw, regenerate, or leave any part of the {occluder_text} "
-        f"in the completed region — only the {subject_text}'s own body may "
-        f"appear there."
+        f" The {occluder_text} may still cross this area — draw no "
+        f"{occluder_text} pixels there, only {subject_text} body."
     ) if occluder_text else ""
     prompt = (
-        f"Photorealistic complete {subject_text}, full body continuing "
-        f"seamlessly from the visible portion behind the occluder. Matching "
-        f"lighting, texture, anatomy and color. Sharp focus, high detail. "
-        f"Plain neutral background.{occluder_clause}"
+        f"Inpaint only this masked region. Continue the SAME single "
+        f"{subject_text} already visible in the photo — exactly one "
+        f"subject, no duplicate, no second animal, no new subject anywhere. "
+        f"Match its exact color, texture, pose and lighting. Keep every "
+        f"unmasked pixel unchanged; do not invent, replace, or regenerate "
+        f"any background or scenery.{occluder_clause}"
     )
-    neg_extra = "distorted anatomy, duplicate parts, blurry, low detail"
+    neg_extra = (
+        "distorted anatomy, duplicate subject, second animal, extra animal, "
+        "collage, multiple subjects, sprite sheet, blurry, low detail, "
+        "background replaced, new scenery, studio backdrop, plain backdrop"
+    )
     if occluder_text:
         neg_extra += f", {occluder_text}"
 
@@ -333,6 +435,8 @@ def main() -> int:
     current_neg_extra = neg_extra
     review_log        = []
     flux_bgr = flux_rgb = None
+    best_score = -1.0
+    best_cand  = None   # (attempt, cand_bgr, cand_rgb) — highest-scoring attempt seen
 
     for attempt in range(1, max_retries + 2):
         print(f"\nRunning Flux-Fill on the cutout (attempt {attempt}/{max_retries + 1})…")
@@ -348,6 +452,7 @@ def main() -> int:
             neg_extra=current_neg_extra,
             seed_offset=(attempt - 1) * 7,
             strength=1.0,
+            keep_loaded=True,   # nothing else needs the GPU between retries — freed once, below
         )
         dt = time.time() - t0
         print(f"  Flux done in {dt:.1f}s")
@@ -407,8 +512,22 @@ def main() -> int:
         print(f"  Feedback: {review.get('feedback', '')[:200]}")
         review_log.append({"attempt": attempt, **review})
 
-        if score >= score_thresh or attempt >= max_retries + 1:
+        if score > best_score:
+            best_score = score
+            best_cand  = (attempt, cand_bgr, cand_rgb)
+
+        if score >= score_thresh:
             flux_bgr, flux_rgb = cand_bgr, cand_rgb
+            break
+        if attempt >= max_retries + 1:
+            # No attempt reached score_thresh. Keep the best-scoring attempt
+            # seen across the whole run, NOT just this last one — Flux/the
+            # reviewer's own retries are not monotonically improving, so the
+            # last attempt tried is not necessarily the best one produced.
+            best_attempt, flux_bgr, flux_rgb = best_cand
+            print(f"  [Agent 3: Reviewer] no attempt reached {score_thresh}/10 after "
+                  f"{attempt} attempts — keeping best-scoring attempt "
+                  f"{best_attempt} (score={best_score})")
             break
 
         print(f"  [Agent 3: Reviewer] score below threshold ({score_thresh}) — retrying")
@@ -420,6 +539,9 @@ def main() -> int:
     if review_log:
         with open(test_dir / "review_log.json", "w") as f:
             json.dump(review_log, f, indent=2)
+    # Retry loop kept Flux resident across attempts (keep_loaded=True) —
+    # release it now, once, before SAM3 needs the GPU below.
+    _free_flux_fill()
     # ── Re-segment Flux's output to capture the FULL generated silhouette ─
     # Jiang Ao approach (amodal/main.py:517 filter_out_amodal_segmentation):
     # take ALL SAM3 mask candidates and pick the one with the highest
@@ -504,7 +626,7 @@ def main() -> int:
     current_mask  = final_mask.copy()
     sides_touched = _check_touch_boundary(current_mask)
     print(f"\n[OffFrame] sides touched after in-frame Flux: {sides_touched or 'none'}")
-    if sides_touched and not getattr(config, "USE_OFFFRAME_EXTENSION", True):
+    if sides_touched and not getattr(config, "USE_OFFFRAME_EXTENSION", False):
         print("[OffFrame] disabled via config.USE_OFFFRAME_EXTENSION — skipping")
         sides_touched = set()
 

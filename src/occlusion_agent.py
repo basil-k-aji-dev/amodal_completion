@@ -11,6 +11,7 @@ Produces: occluder mask, visible-object modal mask, and (via
 Can be re-invoked on mask failures (MASK_INACCURATE / OCCLUDER_REMNANT).
 """
 import json
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -738,7 +739,7 @@ Respond ONLY in JSON matching the schema."""
     # PSALM-class-split / connected-components / SAM3-dual-click needed.
     instaformer_result = None
     instaformer_visible_seed: Optional[np.ndarray] = None
-    if getattr(config, "USE_INSTAFORMER", False):
+    if getattr(config, "USE_INSTAFORMER", True):
         try:
             from instaformer_helper import (
                 run_instaformer, occluders_above, same_class_split,
@@ -1217,7 +1218,7 @@ Respond ONLY in JSON matching the schema."""
     #   • USE_AMODAL_COMPLETION=False → use visible_mask AS-IS (no completion)
     #   • USE_AMODAL_COMPLETION=True  → direct GPT-V silhouette call
     try:
-        if not getattr(config, "USE_AMODAL_COMPLETION", True):
+        if not getattr(config, "USE_AMODAL_COMPLETION", False):
             # No amodal extension — use visible_mask as the amodal mask.
             # PSALM's visible segmentation is treated as authoritative; no
             # GPT-V silhouette generation (which often drifts onto the occluder).
@@ -1270,9 +1271,18 @@ Respond ONLY in JSON matching the schema."""
 
         # ── step 3: off-frame extension via GPT-V on padded canvas ─────────
         # Fires when GPT flagged frame_cropped=True with non-zero
-        # expansion_pixels, OR when config.FORCE_FRAME_CROPPED is set (debug).
+        # expansion_pixels AND config.USE_OFFFRAME_EXTENSION is on — that
+        # flag is meant to be the global kill-switch for this whole feature
+        # (offframe.py's own docstring says as much), but this condition
+        # used to check only frame_cropped/force_offframe and never
+        # consulted it, so a "disabled" pipeline still ran a full extra
+        # Flux outpaint pass whenever GPT flagged an image as frame-cropped.
+        # config.FORCE_FRAME_CROPPED (debug) intentionally bypasses the gate.
+        offframe_enabled = force_offframe or (
+            frame_cropped and getattr(config, "USE_OFFFRAME_EXTENSION", False)
+        )
         offframe_px = (force_exp_px if force_offframe else exp_px) \
-            if (force_offframe or frame_cropped) else None
+            if offframe_enabled else None
         if (
             offframe_px is not None
             and isinstance(offframe_px, dict)

@@ -113,6 +113,7 @@ def gpt_vision(images: list, prompt: str, schema: dict = None,
             "input":     [{"role": "user", "content": content}],
             "reasoning": {"effort": "high", "summary": "concise"},
             "text":      text_cfg,
+            "max_output_tokens": config.GPT_MAX_TOKENS,
         }
         if cache_key:
             kwargs["prompt_cache_key"]       = cache_key

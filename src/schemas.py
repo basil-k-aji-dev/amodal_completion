@@ -105,6 +105,11 @@ OCCLUSION_SCHEMA = {
                 "type": "array",
                 "items": {"type": "array", "items": {"type": "integer"}},
             },
+            # Legacy click-point fields. Unused by default (see
+            # config.USE_OCCLUDER_CLICK) in favour of SAM3 text-prompted
+            # segmentation, but kept in the schema/prompt so the click-based
+            # matching path can be reverted to via config without a schema
+            # migration.
             "occluder_click": {
                 "type": "object",
                 "properties": {

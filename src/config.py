@@ -4,7 +4,7 @@ IMAGE_PATH = "/home/basil-k-aji/Desktop/Workspace/RD/website/animal-8518802_640_
 # Optional hint telling Agent 1 what the occluded subject is (e.g. "horse").
 # Default is empty — Agent 1 auto-detects the occluded object itself from
 # the image. Only set this when you want to steer detection explicitly.
-INPUT_PROMPT = "horse"
+INPUT_PROMPT = ""
 
 # Iterative off-frame canvas-extension loop (pad + outpaint when the subject
 # touches a frame edge). Disabled for now — focus on getting the occluded-
@@ -17,7 +17,7 @@ USE_OFFFRAME_EXTENSION = False
 # suggested prompt/negative-prompt fix (up to REVIEWER_MAX_RETRIES times).
 USE_REVIEWER              = True
 REVIEWER_SCORE_THRESHOLD  = 7.0   # score >= this = accepted, stop retrying
-REVIEWER_MAX_RETRIES      = 2     # extra attempts beyond the first
+REVIEWER_MAX_RETRIES      = 1     # extra attempts beyond the first
 
 # ── GPT (loaded from .env: OPENAI_MODEL, OPENAI_API_KEY) ─────────────────────
 # Passed to the Responses API as max_output_tokens (see runtime.py:gpt_vision
@@ -86,6 +86,23 @@ FLUX_FILL_GROUP_USE_STREAM  = False
 FLUX_FILL_OFFLOAD_DISK_PATH = "/tmp/flux_fill_offload"
 FLUX_FILL_LOW_CPU_MEM_USAGE = False
 
+# ── Optional two-stage depth-guided fill (src/models/flux_depth.py) ──────
+# Before Flux-Fill runs, estimate a depth map of the cutout and run
+# FLUX.1-Depth-dev (a depth-conditioned FULL-image generator, not a masked
+# inpainter) to hallucinate a plausible complete subject; that guide
+# image's content is pasted into the hidden region — replacing the blank
+# gray placeholder — before Flux-Fill refines/blends it in at partial
+# strength. Off by default: it's a real extra GPU pass (two more model
+# loads) and only helps cases where the mask sits over genuinely-occluded
+# geometry that needs structural grounding — it does nothing for a mask
+# that's wrong in the first place.
+USE_DEPTH_GUIDED_FILL      = False
+DEPTH_ESTIMATOR_MODEL_ID   = "depth-anything/Depth-Anything-V2-Large-hf"
+FLUX_DEPTH_MODEL_ID        = "black-forest-labs/FLUX.1-Depth-dev"
+FLUX_DEPTH_STEPS           = 28
+FLUX_DEPTH_GUIDANCE_SCALE  = 10.0
+DEPTH_GUIDED_FILL_STRENGTH = 0.65   # partial-strength refine over the pasted guide, not a full regenerate
+
 # ── mmgp offload (alternative to diffusers block/model offload) ────────
 # https://github.com/deepbeepmeep/mmgp — smarter memory manager that keeps
 # Flux resident across multi-iter runs, slices adaptively, and uses async
@@ -135,13 +152,36 @@ MIN_EXTENSION_PX           = 100      # kept for future experimentation
 # of one plausible continuation. A compact occluder (already close to
 # subject-sized, e.g. a person) is barely affected by this clip.
 BOUND_HIDDEN_TO_SUBJECT_BBOX  = True
-HIDDEN_REGION_BBOX_MULTIPLIER = 2.0   # expand visible bbox by this factor about its center
+HIDDEN_REGION_BBOX_MULTIPLIER = 1.3   # expand visible bbox by this factor about its center
 HIDDEN_REGION_MIN_EXPANSION_PX = 100  # floor on the expansion in px per side
+
+# ── Area-ratio sanity check on the occluder mask (src/pipeline.py) ───────────
+# Bbox-clipping above only bounds the OUTER extent of `hidden` — it doesn't
+# check whether the occluder segmentation itself is a sane size before it
+# gets dilated. A wildly oversized/wrong occluder mask (e.g. a "teacup"
+# segmentation bleeding into an entire tabletop — observed at 2.76x the
+# vase's own visible area) still survives bbox-clipping partially intact,
+# because clipping shrinks extent, it doesn't validate content. If the
+# occluder mask exceeds OCCLUDER_MAX_AREA_RATIO times the visible subject's
+# area, trim it to only the pixels within OCCLUDER_PROXIMITY_PX of the
+# visible subject — a real occluder must physically border what it hides.
+OCCLUDER_MAX_AREA_RATIO = 2.5
+OCCLUDER_PROXIMITY_PX   = 60
 
 # Mixed Context Diffusion Sampling (Xu et al., CVPR 2024) was removed —
 # permanently disabled via USE_MIXED_CONTEXT=False, and its ControlNet→Flux
 # refinement cascade via USE_FLUX_REFINEMENT=False. See mixed_context.py in
 # git history for the original implementation.
+
+# Optional 3D generation (Hunyuan3D-2.1), run after the occlusion-completed
+# 2D image is finalized. Hunyuan3D-2.1 lives in its own conda env (separate
+# torch/CUDA build from this project's .venv) - invoked as a subprocess
+# against Hunyuan3D-2.1/generate_3d.py, not imported in-process. Off by
+# default; each run costs several extra minutes of GPU time for a
+# shape+texture pass most callers won't want on every single image.
+RUN_3D_GENERATION_HUNYUAN3D = False
+HUNYUAN3D_REPO_DIR = "/home/ubuntu/Workspace/amodal_completion/Hunyuan3D-2.1"
+HUNYUAN3D_CONDA_ENV = "hunyuan3d"
 
 # ── Mask dilation ─────────────────────────────────────────────────────────────
 MASK_EXPAND = 20    # px for elliptical dilation of the occluder mask
@@ -181,6 +221,18 @@ AISFORMER_ENABLED    = False   # MINIMAL pipeline: AISFormer OFF (no SAM3 featur
 # machinery is no longer needed.
 # Runs as a subprocess in its own isolated venv (Python 3.8 + Detectron2 +
 # torch 2.1.0/cu118 — incompatible with this project's own environment).
+# SAM3-text vs. click-point instance matching: with USE_OCCLUDER_CLICK=False
+# (default), Agent 1 only has to NAME the subject/occluder — SAM3's
+# text-prompted segmentation (Promptable Concept Segmentation) finds the
+# actual pixels, and InstaFormer's instance is matched to that SAM3-text
+# mask via IoU. This removes GPT-supplied pixel coordinates from the mask
+# pipeline entirely, which were a source of run-to-run mask variance
+# (GPT-5 reasoning calls have no temperature/seed control, so the same
+# image could get slightly different click coordinates each run).
+# Set True to revert to the old click_xy-driven InstaFormer matching
+# (occluder_click/subject_click from Agent 1) without a schema migration —
+# both fields stay in OCCLUSION_SCHEMA and the prompt regardless of this flag.
+USE_OCCLUDER_CLICK      = False
 USE_INSTAFORMER         = True
 INSTAFORMER_REPO_DIR    = "/home/ubuntu/Workspace/amodal_completion/InstaFormer"
 INSTAFORMER_VENV_PYTHON = "/home/ubuntu/Workspace/amodal_completion/.instaformer-venv/bin/python"
@@ -210,9 +262,22 @@ INSTAFORMER_CKPT        = ("/home/ubuntu/Workspace/amodal_completion/InstaFormer
 MASK_FUSION_MODE      = "priority"
 MASK_FUSION_MIN_AGREE = 2
 MASK_FUSION_PRIORITY  = [
+    "sam3_text_occluder",  # SAM3 open-vocabulary text segmentation of GPT's
+                           # named occluder (e.g. "front cup") — the most
+                           # targeted signal since it's anchored to the
+                           # specific discrete object GPT named, not a
+                           # touch-based relation. Preferred over InstaFormer:
+                           # InstaFormer's occluders_above() adjacency filter
+                           # only checks that a candidate's mask TOUCHES the
+                           # subject — for a subject standing ON a table, the
+                           # table always touches it, so a whole oversized
+                           # table/"stuff"-adjacent instance can pass as an
+                           # "occluder" (observed: 76,046px table mask vs. the
+                           # vase's own 27,566px visible area, when the actual
+                           # occluding cup was only 13,495px via SAM3-text).
     "instaformer_pair",    # same-class occlusion via InstaFormer's own
                            # panoptic segmentation + occlusion matrix
                            # (zebra/zebra, cat/cat) — resolved natively
     "instaformer",         # holistic occlusion order over InstaFormer's
-                           # own panoptic segments — primary signal
+                           # own panoptic segments — fallback signal
 ]

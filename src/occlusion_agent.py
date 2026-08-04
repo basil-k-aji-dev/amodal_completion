@@ -29,6 +29,45 @@ from models.sam3 import (
     _sam_segment_targeted,
 )
 
+_POSITION_WORDS = {"left", "right", "front", "back", "rear",
+                    "foreground", "background", "top", "bottom", "near", "far"}
+
+
+def _split_position_and_class(text: str) -> tuple:
+    """Split a GPT class string like "left horse" into ("left", "horse") so
+    SAM3-text is queried with the bare class noun (its language grounding
+    isn't relied on to parse spatial prepositions) and the position word is
+    used afterwards to pick the right instance among SAM3's returned hits.
+    Returns (None, text) if there's no recognised position prefix."""
+    words = (text or "").strip().lower().split()
+    if len(words) >= 2 and words[0] in _POSITION_WORDS:
+        return words[0], " ".join(words[1:])
+    return None, (text or "").strip()
+
+
+def _pick_instance_by_position(hits: list, position_word: Optional[str]) -> Optional[dict]:
+    """From SAM3-text's {score, box, mask} hits for a class noun, pick the
+    one matching a position qualifier (left/right/front/back/...). Falls
+    back to the highest-scoring hit when there's no position word or only
+    one hit — deterministic, no GPT-supplied coordinates needed."""
+    if not hits:
+        return None
+    if not position_word or len(hits) == 1:
+        return hits[0]
+
+    def cx(hit): x1, _, x2, _ = hit["box"]; return (x1 + x2) / 2
+    def cy(hit): _, y1, _, y2 = hit["box"]; return (y1 + y2) / 2
+    def area(hit): x1, y1, x2, y2 = hit["box"]; return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    if position_word == "left":                                 return min(hits, key=cx)
+    if position_word == "right":                                return max(hits, key=cx)
+    if position_word == "top":                                  return min(hits, key=cy)
+    if position_word == "bottom":                               return max(hits, key=cy)
+    if position_word in ("front", "near", "foreground"):        return max(hits, key=area)
+    if position_word in ("back", "rear", "far", "background"):  return min(hits, key=area)
+    return hits[0]
+
+
 def _gpt_amodal_subject_mask(
     image_bgr: np.ndarray,
     visible_mask: np.ndarray,
@@ -365,6 +404,21 @@ SAM3 segments (id, bbox [x1,y1,x2,y2], area px, polygon up to 12 [x,y] pts):
 {json.dumps(seg_summary, indent=2)}
 
 ══════════════════════════════════════════════════════════════════════
+SCOPE RESTRICTION (temporary, current testing phase)
+══════════════════════════════════════════════════════════════════════
+Humans/people must NOT be selected as the SUBJECT (`occluded_object`)
+right now — reconstructing fully-hidden human anatomy (hands especially)
+is a known unsolved weak point, so testing is currently restricted to
+NON-HUMAN subjects (animals, vehicles, plants, household objects, etc).
+If both a human and a non-human object appear in the scene, ALWAYS
+select the non-human object as the subject — even if the human looks
+more prominently occluded, and even if the user hint above names a
+person. A human MAY still be selected as the OCCLUDER (blocking a
+non-human subject) — that role is unaffected by this restriction.
+Only fall back to a human subject if literally no non-human object
+exists anywhere in the frame.
+
+══════════════════════════════════════════════════════════════════════
 STEP 1 — IDENTIFY THE SUBJECT
 ══════════════════════════════════════════════════════════════════════
 Carefully examine the image and identify the primary subject (animal, person, object).
@@ -474,6 +528,28 @@ which pixels get segmented.  Follow these rules EXACTLY:
   4) LENGTH  :  1–3 words.  No commas, no parens, no dashes.
 
   5) LOWERCASE preferred but accepted as-is.
+
+  6) PREFER THE SPECIFIC, DISCRETE OBJECT OVER A GENERIC MATERIAL/TEXTURE
+     TERM — this matters because when no standard-category segmentation
+     source finds the occluder, the pipeline falls back to an open-
+     vocabulary text search for whatever noun you give it, ACROSS THE
+     WHOLE IMAGE. A generic material/texture term (snow, grass, leaves,
+     water, rock, sand, fabric) matches every occurrence of that texture
+     anywhere in the scene — including patches nowhere near the subject
+     — so the fallback can pick a totally unrelated region instead of the
+     one actually blocking the subject. A specific, discrete object noun
+     (this particular mound/pile/bank/patch) names the ONE object in
+     front of the subject, not the material it's made of.
+       ✓ "snowbank", "snowdrift", "snow mound"  (the specific foreground
+         object hiding the subject)
+       ✗ "snow"  (matches every snow pixel in the image, including
+         background snow far from the subject)
+       ✓ "leaf pile", "branch", "shrub"   ✗ "leaves", "foliage", "plant"
+       ✓ "rock", "boulder"                ✗ "rocks", "gravel", "stone" (as
+         a scattered/plural material rather than one discrete object)
+     If the occluder genuinely IS a broad expanse (e.g. the subject is
+     behind a wall of foliage with no single describable mound/clump),
+     name the nearest describable discrete chunk of it, not the material.
 
 Worked example for two zebras grazing, front (left) blocking rear (right):
   occluded_object = "right zebra"
@@ -618,6 +694,9 @@ Re-read your `occluded_object` and `occluder` strings:
   • If the two objects are the same class, both strings MUST share
     that class noun and be disambiguated only by a position prefix
     (left/right/front/back/etc).
+  • `occluder` names the specific discrete object hiding the subject,
+    NOT the generic material/texture it's made of (rule 6 above) —
+    "snowbank" not "snow", "leaf pile" not "leaves".
 If your strings fail this check, fix them BEFORE responding.
 
 Respond ONLY in JSON matching the schema."""
@@ -737,6 +816,47 @@ Respond ONLY in JSON matching the schema."""
     # (zebra/zebra, cat/cat) falls out naturally since InstaFormer assigns
     # each instance its own segment id and ranks them directly, no
     # PSALM-class-split / connected-components / SAM3-dual-click needed.
+    # ── Primary segmentation: SAM3 text-prompted (Promptable Concept
+    # Segmentation), driven only by GPT's class-noun strings — no click
+    # points needed. GPT's job is reduced to naming the subject/occluder
+    # (with an optional position prefix for same-class disambiguation, e.g.
+    # "left horse"/"right horse"); SAM3 finds and segments the actual
+    # pixels. This is deterministic given the same image+text, unlike
+    # GPT-supplied click coordinates (GPT-5 reasoning calls have no
+    # temperature/seed control, so clicks — and therefore which InstaFormer
+    # instance gets matched — could drift slightly run to run).
+    # config.USE_OCCLUDER_CLICK reverts to the old click-driven matching.
+    use_click = getattr(config, "USE_OCCLUDER_CLICK", False)
+
+    subj_position, subj_class_noun = _split_position_and_class(target_class)
+    occ_position,  occ_class_noun  = _split_position_and_class(occluder_class)
+
+    sam3_subject_mask: Optional[np.ndarray] = None
+    sam3_occluder_mask: Optional[np.ndarray] = None
+    if not use_click:
+        if subj_class_noun:
+            subj_hits = _sam3_text_segment(state["image_path"], subj_class_noun)
+            picked = _pick_instance_by_position(subj_hits, subj_position)
+            if picked is not None:
+                m = picked["mask"]
+                if m.shape[:2] != (h, w):
+                    m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+                sam3_subject_mask = m.astype(np.uint8)
+                print(f"  [SAM3-text] subject '{subj_class_noun}' "
+                      f"(position={subj_position}): {int(sam3_subject_mask.sum())} px")
+
+        if occ_class_noun:
+            occ_hits = _sam3_text_segment(state["image_path"], occ_class_noun)
+            picked = _pick_instance_by_position(occ_hits, occ_position)
+            if picked is not None:
+                m = picked["mask"]
+                if m.shape[:2] != (h, w):
+                    m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+                sam3_occluder_mask = m.astype(np.uint8)
+                print(f"  [SAM3-text] occluder '{occ_class_noun}' "
+                      f"(position={occ_position}): {int(sam3_occluder_mask.sum())} px")
+                mask_candidates.append(("sam3_text_occluder", sam3_occluder_mask))
+
     instaformer_result = None
     instaformer_visible_seed: Optional[np.ndarray] = None
     if getattr(config, "USE_INSTAFORMER", True):
@@ -758,14 +878,23 @@ Respond ONLY in JSON matching the schema."""
             instaformer_result = None
 
         if instaformer_result is not None:
-            sx = int(sub_click.get("x", 0))
-            sy = int(sub_click.get("y", 0))
-            click_xy = (sx, sy) if (sx or sy) else None
-            target_idx = (best_matching_segment(instaformer_result, click_xy=click_xy)
-                          if click_xy is not None else None)
+            if use_click:
+                sx = int(sub_click.get("x", 0))
+                sy = int(sub_click.get("y", 0))
+                click_xy = (sx, sy) if (sx or sy) else None
+                target_idx = (best_matching_segment(instaformer_result, click_xy=click_xy)
+                              if click_xy is not None else None)
+                no_match_reason = "no subject_click to match a target segment"
+            else:
+                target_idx = (best_matching_segment(instaformer_result,
+                                                      target_mask=sam3_subject_mask)
+                              if sam3_subject_mask is not None else None)
+                no_match_reason = "no SAM3-text subject mask to match against"
 
             if target_idx is not None:
-                io_mask = occluders_above(instaformer_result, click_xy=click_xy)
+                io_mask = (occluders_above(instaformer_result, click_xy=click_xy)
+                           if use_click else
+                           occluders_above(instaformer_result, target_mask=sam3_subject_mask))
                 if io_mask is not None and io_mask.sum() > 0:
                     mask_candidates.append(("instaformer", io_mask.astype(np.uint8)))
                     print(f"  [InstaFormer] occluder candidate: {int(io_mask.sum())} px")
@@ -794,8 +923,7 @@ Respond ONLY in JSON matching the schema."""
                         print(f"  [InstaFormer] target segment as visible seed: "
                               f"{int(instaformer_visible_seed.sum())} px")
             else:
-                print("  [InstaFormer] no subject_click to match a target segment "
-                      "— skipping")
+                print(f"  [InstaFormer] {no_match_reason} — skipping")
 
 
     # Persist each candidate for inspection.
@@ -873,13 +1001,28 @@ Respond ONLY in JSON matching the schema."""
                       f"{raw_area} px raw, {int(occluder_mask.sum())} px "
                       f"after adjacency filter (score={sam3_text_hits[0]['score']:.2f})")
             else:
-                # Nothing survived adjacency filtering (e.g. the match was
-                # entirely elsewhere in the frame) — use the raw mask
-                # rather than silently producing an empty occluder.
-                occluder_mask = raw_mask
+                # Nothing survived adjacency filtering — the raw match is
+                # nowhere near the subject. This is expected for a generic,
+                # multi-instance texture term (GPT said "snow" rather than
+                # "snowbank"): SAM3-text's open-vocabulary search matches
+                # EVERY instance across the whole scene, so the raw mask can
+                # legitimately be a totally unrelated occurrence elsewhere
+                # in the frame (observed in practice: occluder ended up in
+                # the opposite corner from the actual subject). Using it
+                # anyway is worse than the geometrically-anchored bbox
+                # fallback the sibling "no candidates at all" branch below
+                # already uses — fall back to that instead of the
+                # unconstrained raw mask.
+                occluder_mask = np.zeros((h, w), dtype=np.uint8)
+                occluder_mask[
+                    max(0, int(bbox[1])):min(h, int(bbox[3])),
+                    max(0, int(bbox[0])):min(w, int(bbox[2])),
+                ] = 1
                 print(f"  [SAM3-text] occluder fallback: '{occ_text}' → "
-                      f"{raw_area} px (adjacency filter kept nothing — "
-                      f"using raw mask, score={sam3_text_hits[0]['score']:.2f})")
+                      f"{raw_area} px raw (score={sam3_text_hits[0]['score']:.2f}), "
+                      f"adjacency filter kept nothing — using hidden_region bbox "
+                      f"({int(occluder_mask.sum())} px) instead of the unconstrained "
+                      f"whole-image match")
         else:
             print("  WARNING: no occluder candidates (incl. SAM3-text) — "
                   "falling back to hidden_region bbox")
@@ -915,6 +1058,9 @@ Respond ONLY in JSON matching the schema."""
     if instaformer_visible_seed is not None and instaformer_visible_seed.sum() > 0:
         visible_mask = instaformer_visible_seed.copy()
         print(f"  InstaFormer-pair visible seed: {int(visible_mask.sum())} px")
+    elif sam3_subject_mask is not None and sam3_subject_mask.sum() > 0:
+        visible_mask = sam3_subject_mask.copy()
+        print(f"  SAM3-text subject seed: {int(visible_mask.sum())} px")
 
     if vis_ids:
         for sid in vis_ids:

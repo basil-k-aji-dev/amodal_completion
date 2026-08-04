@@ -59,6 +59,11 @@ InstaFormer/
 cuda-11.8-local/
 detectron2/
 
+# ── External evaluation checkouts (cloned repos, not project deps) ─────
+Hunyuan3D-2.1/
+LISA/
+.lisa-venv/
+
 # ── Backup / archive artifacts ─────────────────────────────────────────
 output.zip
 results_backup/

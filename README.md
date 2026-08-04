@@ -167,10 +167,94 @@ All in `src/config.py`. Currently-validated defaults:
 | `USE_INSTAFORMER` | `True` | InstaFormer is the occluder/depth-order ranking signal (via subprocess) |
 | `USE_REVIEWER` | `True` | Agent 3 — GPT-vision reviewer scores each Flux completion and retries on a low score |
 | `REVIEWER_SCORE_THRESHOLD` | `7.0` | score ≥ this = accepted, stop retrying |
-| `REVIEWER_MAX_RETRIES` | `2` | extra Flux attempts beyond the first if the reviewer rejects |
+| `REVIEWER_MAX_RETRIES` | `1` | extra Flux attempts beyond the first if the reviewer rejects |
 | `USE_OFFFRAME_EXTENSION` | `False` | iterative off-frame canvas extension; disabled while in-frame quality is being tuned |
 | `FLUX_FILL_CPU_OFFLOAD` | `False` | Flux runs fully on device; enable on <24 GB cards |
 | `GPU_MEMORY_LIMIT_GB` | `44.0` | hard cap, leaves OS headroom (tuned for a 48 GB card) |
+| `RUN_3D_GENERATION_HUNYUAN3D` | `False` | optional post-step, see "3D generation" below |
+| `USE_OCCLUDER_CLICK` | `False` | click-point-driven InstaFormer matching; `False` = SAM3-text is the primary mask source instead (see below) |
+| `OCCLUDER_MAX_AREA_RATIO` | `2.5` | trim the occluder mask if it exceeds this multiple of the subject's visible area |
+| `OCCLUDER_PROXIMITY_PX` | `60` | when trimming, keep only occluder pixels within this many px of the visible subject |
+
+## Mask-selection fixes (this cycle)
+
+A round of live testing surfaced two real bugs in how the occluder/hidden-region
+mask gets built, both now fixed:
+
+- **Fusion-priority bug**: `MASK_FUSION_PRIORITY` never listed the SAM3-text
+  candidate, so `mode="priority"` fusion silently preferred InstaFormer's mask
+  even when it was badly oversized (observed: a 76,046px InstaFormer "table"
+  mask winning over a correct 13,495px SAM3-text "cup" mask). Fixed by adding
+  `sam3_text_occluder` as the top priority entry.
+- **Click-point non-determinism**: `occlusion_agent.py` used to match
+  InstaFormer's target instance via a GPT-supplied click point. GPT-5's
+  reasoning calls have no temperature/seed control, so the same image could
+  get a slightly different click — and therefore a different matched
+  instance — on different runs. Replaced with SAM3-text segmentation of
+  GPT's class-noun string (plus a position-word heuristic for same-class
+  disambiguation, e.g. "left horse"/"right horse"), which is deterministic
+  given the same image + text. `USE_OCCLUDER_CLICK=True` reverts to the old
+  behavior without a schema migration — both fields stay in
+  `OCCLUSION_SCHEMA` regardless of the flag.
+- **Area-ratio sanity check**: bbox-clipping alone only bounds the *outer
+  extent* of the hidden region — it doesn't check whether the occluder mask
+  itself is a sane size before it's dilated. Added a check in `pipeline.py`
+  that trims the occluder mask to the pixels near the visible subject when it
+  exceeds `OCCLUDER_MAX_AREA_RATIO`.
+- **`INPUT_PROMPT` default was `"horse"`**, left over from early testing,
+  contradicting its own comment ("empty = auto-detect"). Every "no hint" run
+  was silently getting a `"horse"` hint. Fixed to `""`.
+- **Output folder naming**: `_flux_cutout_<subject>` was named from the CLI
+  hint *before* Agent 1 ran, so every no-hint run got an identically-named
+  folder regardless of the image. Now renamed after Agent 1 reports the real
+  subject.
+- **Subject scope restriction (temporary)**: humans are excluded from subject
+  selection for now — Flux reliably fails on fully-occluded hand/finger
+  anatomy. If a human and a non-human both appear in a scene, the non-human
+  is preferred as the subject; a human can still be the *occluder*.
+
+**Known open issue, not yet fixed**: when the subject sits ON/AROUND the
+occluder (perched on a branch, a ball between paws) rather than the occluder
+simply covering it from the front, `dilate(occluder) \ visible` shapes the
+hidden region like the occluder itself, not like the subject's hidden
+anatomy — this correlates with `OCCLUDER_REGENERATED` failures independently
+across three unrelated test cases (a corgi+ball and two perched-bird+branch
+photos).
+
+**Evaluated, not integrated**: LISA (`dvlab-research/LISA`, 13B checkpoint)
+was evaluated as a possible alternative text→mask source. On a real
+comparison case it under-performed the existing SAM3-text approach on an
+implicit/reasoning-style query and only matched it on a direct, explicit
+noun query — no clear win, so it wasn't wired into the pipeline. Its code
+lives outside this repo's tracked tree (`LISA/`, gitignored) since it's an
+external evaluation, not a dependency.
+
+## 3D generation (optional today, primary focus going forward)
+
+The 2D pipeline's output (a clean, fully-revealed RGBA cutout of the subject)
+is meant to feed a downstream image-to-3D model. That step exists in this
+repo today as an **optional, off-by-default** hook:
+
+- `config.RUN_3D_GENERATION_HUNYUAN3D` (default `False`) — when `True`,
+  `pipeline.py` automatically runs **Hunyuan3D-2.1** (Tencent) against the
+  finished `<subject>_final.png` right after it's published, producing a
+  textured `.glb` in the same `final/` folder.
+- Invoked as a subprocess into its own conda env (`Hunyuan3D-2.1/`, a
+  separate torch/CUDA build from this project's `.venv`) via
+  `Hunyuan3D-2.1/generate_3d.py --image ... --out-dir ... --prefix ...`.
+  Failure there is non-fatal — the 2D result is already published either way.
+
+**Why Hunyuan3D-2.1** over other candidates evaluated for this (Microsoft
+TRELLIS.2, Sm0kyWu/Amodal3R): on every side-by-side test run against the
+same completed 2D cutout, Hunyuan3D-2.1 consistently produced the most
+correct volume/depth and the cleanest, least-artifacted PBR texture. It's
+the model this project is standardizing on for 3D generation.
+
+**This is a live area of active work**, not a finished feature — the
+current integration is a first pass (whole-image shape+paint call, no
+occlusion-aware conditioning at the 3D stage itself). A more robust
+image→3D pipeline built on Hunyuan3D-2.1 is planned as the next major
+piece of work here.
 
 ## What's intentionally not in this repo
 

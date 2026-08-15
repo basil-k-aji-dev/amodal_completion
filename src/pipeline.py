@@ -142,14 +142,65 @@ def _make_comparison(panels: list, labels: list, out_path: Path) -> None:
 
 
 def _publish_final(test_dir: Path, rgba_src: Path, subject_slug: str) -> None:
-    """Copy the final RGBA cutout + comparison grid into test_dir/final/."""
+    """Copy the final RGBA cutout + comparison grid into test_dir/final/,
+    then optionally kick off Hunyuan3D-2.1 3D generation on it (see
+    config.RUN_3D_GENERATION_HUNYUAN3D — off by default)."""
     final_dir = test_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
+    final_rgba = final_dir / f"{subject_slug}_final.png"
     if rgba_src.exists():
-        shutil.copy2(rgba_src, final_dir / f"{subject_slug}_final.png")
+        shutil.copy2(rgba_src, final_rgba)
     comparison_src = test_dir / "comparison.png"
     if comparison_src.exists():
         shutil.copy2(comparison_src, final_dir / "comparison.png")
+
+    if getattr(config, "RUN_3D_GENERATION_HUNYUAN3D", False) and final_rgba.exists():
+        _run_hunyuan3d_generation(final_rgba, final_dir, subject_slug)
+
+
+def _run_hunyuan3d_generation(image_path: Path, out_dir: Path, subject_slug: str) -> None:
+    """Run Hunyuan3D-2.1 shape+paint generation on the finished 2D image.
+
+    Hunyuan3D-2.1 needs its own conda env (different torch/CUDA build than
+    this project's .venv), so it's invoked as a subprocess via
+    `conda run`, not imported in-process. Failure is non-fatal — the 2D
+    result is already published; a 3D miss shouldn't fail the whole run.
+    """
+    import subprocess
+
+    repo_dir = getattr(config, "HUNYUAN3D_REPO_DIR", None)
+    conda_env = getattr(config, "HUNYUAN3D_CONDA_ENV", "hunyuan3d")
+    if not repo_dir:
+        print("  [3D] RUN_3D_GENERATION_HUNYUAN3D is set but HUNYUAN3D_REPO_DIR "
+              "isn't configured — skipping")
+        return
+
+    torch_lib = (f"/home/ubuntu/miniconda3/envs/{conda_env}/lib/python3.10/"
+                 f"site-packages/torch/lib")
+    cudart_lib = (f"/home/ubuntu/miniconda3/envs/{conda_env}/lib/python3.10/"
+                  f"site-packages/nvidia/cuda_runtime/lib")
+    cmd = (
+        f'cd {repo_dir} && '
+        f'source /home/ubuntu/miniconda3/etc/profile.d/conda.sh && '
+        f'conda activate {conda_env} && '
+        f'export LD_LIBRARY_PATH="{torch_lib}:{cudart_lib}:${{LD_LIBRARY_PATH:-}}" && '
+        f'python generate_3d.py --image {image_path} --out-dir {out_dir} '
+        f'--prefix {subject_slug}_hunyuan3d'
+    )
+    print(f"  [3D] Running Hunyuan3D-2.1 generation on {image_path.name}…")
+    t0 = time.time()
+    try:
+        result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=1800)
+        if result.returncode == 0:
+            print(f"  [3D] Hunyuan3D-2.1 done in {time.time() - t0:.1f}s -> "
+                  f"{out_dir}/{subject_slug}_hunyuan3d.glb")
+        else:
+            print(f"  [3D] Hunyuan3D-2.1 failed (exit {result.returncode}): "
+                  f"{result.stderr[-500:] if result.stderr else '(no stderr)'}")
+    except subprocess.TimeoutExpired:
+        print("  [3D] Hunyuan3D-2.1 generation timed out after 30 min — skipping")
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  [3D] Hunyuan3D-2.1 generation errored: {exc!r}")
 
 
 def _apply_occlusion_info(info: dict, subject_text: str, input_prompt: str,
@@ -165,12 +216,21 @@ def _apply_occlusion_info(info: dict, subject_text: str, input_prompt: str,
     if occluder_text:
         print(f"  Occluder identified as '{occluder_text}' ({source}) — will "
               f"be explicitly excluded from the Flux prompt")
-    if not input_prompt:
-        detected = (info.get("occluded_object", "") or "").strip()
-        if detected:
+    detected = (info.get("occluded_object", "") or "").strip()
+    if detected:
+        # Prefer Agent 1's own detected identity over a generic CLI hint
+        # whenever it's a refinement of that hint (e.g. hint="horse",
+        # detected="left horse") rather than a wholesale override — this is
+        # exactly the same-class disambiguation Agent 1's prompt is designed
+        # to produce (see the "two zebras" worked example in
+        # occlusion_agent.py), and without it the prompt falls back to the
+        # bare class noun, which is ambiguous between two same-class
+        # instances and leaves Flux no way to tell which one to continue.
+        if not input_prompt or input_prompt.lower() in detected.lower():
+            if subject_text != detected:
+                print(f"  Using {source} detection for the completion prompt "
+                      f"(more specific than the input hint): '{detected}'")
             subject_text = detected
-            print(f"  No input prompt given — using {source} detection for "
-                  f"the completion prompt: '{subject_text}'")
     return subject_text, occluder_text
 
 
@@ -276,6 +336,25 @@ def main() -> int:
         subject_text, occluder_text = _apply_occlusion_info(
             cached_occlusion, subject_text, input_prompt, "cached occlusion.json")
 
+    # `test_dir` was named from the CLI hint (or the generic "subject"
+    # placeholder) BEFORE Agent 1 ran, since its real detected subject
+    # wasn't known yet. When no hint was given, every no-hint run ended up
+    # with an identically-named "_flux_cutout_subject" (or, before the
+    # config.INPUT_PROMPT default was fixed, "_flux_cutout_horse") folder
+    # regardless of the image's actual content. Nothing is written into
+    # test_dir until after this point, so it's safe to rename it now that
+    # subject_text reflects Agent 1's real answer.
+    if not input_prompt:
+        new_slug = re.sub(r"[^a-z0-9]+", "_", subject_text.lower()).strip("_") or subject_slug
+        if new_slug != subject_slug:
+            new_test_dir = out_dir / f"_flux_cutout_{new_slug}"
+            if test_dir.exists() and not any(test_dir.iterdir()):
+                test_dir.rmdir()
+            test_dir = new_test_dir
+            test_dir.mkdir(parents=True, exist_ok=True)
+            subject_slug = new_slug
+            print(f"  Renamed output folder to reflect detected subject → {test_dir}")
+
     # ── Step 2: load masks ────────────────────────────────────────────────
     vis_mask = cv2.imread(str(vis_path), cv2.IMREAD_GRAYSCALE)
     am_mask  = cv2.imread(str(amodal_path), cv2.IMREAD_GRAYSCALE)
@@ -313,6 +392,33 @@ def main() -> int:
         occ_b = (occ_mask > 127).astype(np.uint8)
     else:
         occ_b = np.zeros((h, w), dtype=np.uint8)
+    # ── Area-ratio sanity check: trim a disproportionately large occluder ──
+    # A correctly segmented occluder is normally comparable to (or smaller
+    # than) the subject it's blocking. A wildly oversized occluder mask
+    # (e.g. a "teacup" segmentation bleeding into the whole tabletop) means
+    # dilate(occluder)\visible below would inpaint a huge, mostly-irrelevant
+    # region — this is the vase failure mode's actual root cause. Bbox
+    # clipping further down only bounds the OUTER extent; it doesn't check
+    # whether the occluder mask itself is a sane size. If the ratio is too
+    # high, keep only the occluder pixels physically near the visible
+    # subject — a real occluder must touch/border what it's hiding.
+    vis_area  = int(vis_b.sum())
+    occ_area  = int(occ_b.sum())
+    max_ratio = float(getattr(config, "OCCLUDER_MAX_AREA_RATIO", 2.5))
+    if vis_area > 0 and occ_area > max_ratio * vis_area:
+        prox_px = int(getattr(config, "OCCLUDER_PROXIMITY_PX", 60))
+        prox_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (prox_px * 2 + 1, prox_px * 2 + 1))
+        vis_dilated = cv2.dilate(vis_b, prox_kernel, iterations=1)
+        trimmed = (occ_b & vis_dilated).astype(np.uint8)
+        print(f"  [OcclSanity] occluder {occ_area}px is {occ_area / vis_area:.1f}x the "
+              f"visible subject ({vis_area}px, max {max_ratio}x) — trimming to within "
+              f"{prox_px}px of the subject: {occ_area} → {int(trimmed.sum())} px")
+        if int(trimmed.sum()) > 0:
+            occ_b = trimmed
+        else:
+            print("  [OcclSanity] trim left nothing — keeping untrimmed occluder mask")
+
     # Match amodal/main.py:725-726 for iter 0
     JA_KERNEL = np.ones((5, 5), np.uint8)
     JA_ITERS  = 3
@@ -348,10 +454,24 @@ def main() -> int:
             bbox_mask[max(0, vy1 - ey):min(h, vy2 + ey),
                       max(0, vx1 - ex):min(w, vx2 + ex)] = 1
             hidden_before = int(hidden.sum())
-            hidden = (hidden & bbox_mask).astype(np.uint8)
-            if int(hidden.sum()) < hidden_before:
-                print(f"  [BoundHidden] expanded visible-bbox ({mult}x, min {min_ext}px) "
-                      f"clipped hidden region {hidden_before} → {int(hidden.sum())} px")
+            bounded = (hidden & bbox_mask).astype(np.uint8)
+            # If the expanded bbox doesn't overlap the occluder-derived
+            # hidden region AT ALL, bounding would zero out the fill region
+            # entirely and Flux would never run — strictly worse than the
+            # unbounded (if oversized) region this was meant to shrink.
+            # Most likely cause: Agent 1's occluder detection landed on the
+            # wrong/misaligned region this run. Keep the unbounded region
+            # rather than silently skipping inpainting.
+            if int(bounded.sum()) == 0 and hidden_before > 0:
+                print(f"  [BoundHidden] expanded bbox has ZERO overlap with the "
+                      f"{hidden_before}px hidden region (likely a mismatched "
+                      f"occluder detection this run) — keeping it unbounded "
+                      f"rather than filling nothing")
+            else:
+                hidden = bounded
+                if int(hidden.sum()) < hidden_before:
+                    print(f"  [BoundHidden] expanded visible-bbox ({mult}x, min {min_ext}px) "
+                          f"clipped hidden region {hidden_before} → {int(hidden.sum())} px")
 
     am_b = (vis_b | hidden).astype(np.uint8)   # used by off-frame boundary check below
 
@@ -406,9 +526,18 @@ def main() -> int:
     # continuation of the one existing subject. Every clause below exists
     # to rule out one of those specific failures — keep them explicit
     # rather than trimming back to something vaguer.
+    # Deliberately do NOT name the occluder noun here (e.g. "bowl",
+    # "sticker") in a "draw no X" instruction — diffusion models handle
+    # negation poorly (text encoders have no true logical NOT), so naming
+    # the forbidden object still primes cross-attention toward painting
+    # it. Observed in practice: "draw no bowl pixels" -> Flux paints a
+    # bowl anyway (OCCLUDER_REGENERATED). Use only generic, positive
+    # phrasing instead — describe what TO paint, not what to avoid by name.
     occluder_clause = (
-        f" The {occluder_text} may still cross this area — draw no "
-        f"{occluder_text} pixels there, only {subject_text} body."
+        f" This area was covered by something in front of the "
+        f"{subject_text} that has since been digitally removed — paint "
+        f"only {subject_text} body continuing naturally here, with "
+        f"nothing else in this region."
     ) if occluder_text else ""
     prompt = (
         f"Inpaint only this masked region. Continue the SAME single "
@@ -438,11 +567,23 @@ def main() -> int:
     best_score = -1.0
     best_cand  = None   # (attempt, cand_bgr, cand_rgb) — highest-scoring attempt seen
 
+    fill_base_rgb = cutout_rgb
+    fill_strength = 1.0
+    if getattr(config, "USE_DEPTH_GUIDED_FILL", False):
+        from models.flux_depth import build_depth_guided_base
+        depth_guided_bgr = build_depth_guided_base(
+            cutout_bgr=cutout, hidden_mask=hidden, prompt=prompt,
+        )
+        if depth_guided_bgr is not cutout:   # only switch strength if the guide stage actually ran
+            fill_base_rgb = cv2.cvtColor(depth_guided_bgr, cv2.COLOR_BGR2RGB)
+            fill_strength = float(getattr(config, "DEPTH_GUIDED_FILL_STRENGTH", 0.65))
+            cv2.imwrite(str(test_dir / "depth_guided_base.png"), depth_guided_bgr)
+
     for attempt in range(1, max_retries + 2):
         print(f"\nRunning Flux-Fill on the cutout (attempt {attempt}/{max_retries + 1})…")
         t0 = time.time()
         flux_results = _run_flux_fill_inpaint(
-            base_np=cutout_rgb,
+            base_np=fill_base_rgb,
             inpaint_mask=hidden,
             amodal_rgb_256=np.full((256, 256, 3), 255, dtype=np.uint8),
             prompt=current_prompt,
@@ -451,7 +592,7 @@ def main() -> int:
             prefix=f"flux_completed_attempt{attempt}",
             neg_extra=current_neg_extra,
             seed_offset=(attempt - 1) * 7,
-            strength=1.0,
+            strength=fill_strength,
             keep_loaded=True,   # nothing else needs the GPU between retries — freed once, below
         )
         dt = time.time() - t0
@@ -481,6 +622,19 @@ def main() -> int:
             f"{('a ' + occluder_text) if occluder_text else 'another object'}. The second "
             f"image is the completed result, where the hidden region has been filled in by "
             f"a diffusion model.\n\n"
+            f"IMPORTANT CONTEXT — read before scoring: this pipeline's deliverable is an "
+            f"ISOLATED CUTOUT of the {subject_text}, not a scene-preserving edit. The second "
+            f"image is deliberately composited on a flat neutral-gray background, with the "
+            f"rest of the original scene (walls, floor, foliage, snow, sky, etc.) "
+            f"intentionally removed — that gray background, and the hard boundary between "
+            f"the subject's silhouette and that gray field, is the CORRECT, EXPECTED output "
+            f"format, not a defect. Do NOT score down for the background being replaced by "
+            f"gray, for the original scenery/context being absent, or for a clean edge "
+            f"between the subject and the gray field — none of that was ever part of the "
+            f"task. Judge ONLY the {subject_text} itself: does the newly-painted region of "
+            f"its OWN body look right, and does it read as the same continuous subject as "
+            f"the visible portion (matching fur/texture/color/pose/lighting ON the subject "
+            f"itself)? A perfect score is possible even though the background is flat gray.\n\n"
             f"Score the result 1-10 on: (a) whether the completed region shows the "
             f"{subject_text}'s OWN body continuing naturally — NOT "
             f"{occluder_text or 'the occluder'} regenerated in that space, and NOT a "
@@ -492,7 +646,16 @@ def main() -> int:
             f"If score < {score_thresh}, also fill improved_prompt and "
             f"improved_negative_prompt with a corrected version of this prompt: "
             f"{current_prompt!r} (negative terms: {current_neg_extra!r}) that fixes the "
-            f"specific problem you found."
+            f"specific problem you found. IMPORTANT constraint on improved_prompt: never "
+            f"name {occluder_text or 'the occluder'} inside a 'no X' / 'remove X' / "
+            f"'without X' instruction — diffusion models handle negation poorly, so "
+            f"writing e.g. 'no {occluder_text or 'occluder'}' or 'remove the "
+            f"{occluder_text or 'occluder'}' primes the model to paint it anyway (this is "
+            f"the exact OCCLUDER_REGENERATED failure). Put occluder terms ONLY in "
+            f"improved_negative_prompt (which uses real classifier-free guidance, not "
+            f"text negation) — improved_prompt itself should describe only what TO paint "
+            f"(the subject's own body), using generic phrasing like 'nothing else in this "
+            f"region' instead of naming the object."
         )
         try:
             review = gpt_vision(

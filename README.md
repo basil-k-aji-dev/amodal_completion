@@ -83,13 +83,30 @@ Quality-neutral Ampere perf flags (`cudnn.benchmark`, TF32 matmul, VAE tiling/sl
 
 ## Setup
 
-### Python environment
+**For the full setup reference** — every virtual environment, exact package
+versions, model-weight download steps, and troubleshooting — see
+**[SETUP.md](SETUP.md)**. The short version, via the one-shot provisioning
+script:
+
+```bash
+./setup.sh                # builds .venv, .instaformer-venv, .lisa-venv,
+                           # the hunyuan3d conda env, clones InstaFormer /
+                           # detectron2 / LISA / Hunyuan3D-2.1, and fetches
+                           # the InstaFormer checkpoint
+cp .env.example .env && $EDITOR .env      # fill in OPENAI_API_KEY, OPENAI_MODEL, HF_TOKEN
+.venv/bin/huggingface-cli login           # required for gated SAM3 / Flux-Fill downloads
+```
+
+Run `./setup.sh --help` for flags to skip components you don't need (e.g.
+`--skip-lisa`, `--skip-hunyuan3d`, `--only-main`).
+
+### Manual setup (if you'd rather not use the script)
 
 ```bash
 uv sync
 ```
 
-Requires Python 3.10+. Key deps: `torch`, `diffusers>=0.31`, `transformers`, `openai`, `python-dotenv`.
+Requires Python 3.10+ (tested on 3.12). Key deps: `torch`, `diffusers>=0.31`, `transformers`, `openai`, `python-dotenv`.
 
 ### External dependency: InstaOrder / InstaFormer
 
@@ -109,6 +126,9 @@ INSTAFORMER_VENV_PYTHON = "/abs/path/to/.instaformer-venv/bin/python"
 INSTAFORMER_CKPT        = "/abs/path/to/InstaFormer/checkpoints/instaformer_od_swinl_200.pth"
 ```
 
+See [SETUP.md](SETUP.md) for the legacy `.lisa-venv` and optional `hunyuan3d`
+conda env in the same level of detail.
+
 ### Environment variables
 
 ```bash
@@ -119,6 +139,11 @@ cp .env.example .env
 ### Model weights
 
 All other models (SAM3, Flux-Fill, Depth-Anything) auto-download to your Hugging Face cache on first run. Flux-Fill is gated — accept the license at `huggingface.co/black-forest-labs/FLUX.1-Fill-dev`.
+
+### Test images
+
+`data/positive/` bundles 14 curated positive test cases (self-contained in
+this repo) — see [SETUP.md](SETUP.md#test-images-datapositive) for details.
 
 ## Running
 
@@ -167,10 +192,38 @@ All in `src/config.py`. Currently-validated defaults:
 | `USE_INSTAFORMER` | `True` | InstaFormer is the occluder/depth-order ranking signal (via subprocess) |
 | `USE_REVIEWER` | `True` | Agent 3 — GPT-vision reviewer scores each Flux completion and retries on a low score |
 | `REVIEWER_SCORE_THRESHOLD` | `7.0` | score ≥ this = accepted, stop retrying |
-| `REVIEWER_MAX_RETRIES` | `2` | extra Flux attempts beyond the first if the reviewer rejects |
+| `REVIEWER_MAX_RETRIES` | `1` | extra Flux attempts beyond the first if the reviewer rejects |
 | `USE_OFFFRAME_EXTENSION` | `False` | iterative off-frame canvas extension; disabled while in-frame quality is being tuned |
 | `FLUX_FILL_CPU_OFFLOAD` | `False` | Flux runs fully on device; enable on <24 GB cards |
 | `GPU_MEMORY_LIMIT_GB` | `44.0` | hard cap, leaves OS headroom (tuned for a 48 GB card) |
+| `RUN_3D_GENERATION_HUNYUAN3D` | `False` | optional post-step, see "3D generation" below |
+
+## 3D generation (optional today, primary focus going forward)
+
+The 2D pipeline's output (a clean, fully-revealed RGBA cutout of the subject)
+is meant to feed a downstream image-to-3D model. That step exists in this
+repo today as an **optional, off-by-default** hook:
+
+- `config.RUN_3D_GENERATION_HUNYUAN3D` (default `False`) — when `True`,
+  `pipeline.py` automatically runs **Hunyuan3D-2.1** (Tencent) against the
+  finished `<subject>_final.png` right after it's published, producing a
+  textured `.glb` in the same `final/` folder.
+- Invoked as a subprocess into its own conda env (`Hunyuan3D-2.1/`, a
+  separate torch/CUDA build from this project's `.venv`) via
+  `Hunyuan3D-2.1/generate_3d.py --image ... --out-dir ... --prefix ...`.
+  Failure there is non-fatal — the 2D result is already published either way.
+
+**Why Hunyuan3D-2.1** over other candidates evaluated for this (Microsoft
+TRELLIS.2, Sm0kyWu/Amodal3R): on every side-by-side test run against the
+same completed 2D cutout, Hunyuan3D-2.1 consistently produced the most
+correct volume/depth and the cleanest, least-artifacted PBR texture. It's
+the model this project is standardizing on for 3D generation.
+
+**This is a live area of active work**, not a finished feature — the
+current integration is a first pass (whole-image shape+paint call, no
+occlusion-aware conditioning at the 3D stage itself). A more robust
+image→3D pipeline built on Hunyuan3D-2.1 is planned as the next major
+piece of work here.
 
 ## What's intentionally not in this repo
 

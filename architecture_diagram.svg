@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1360" viewBox="0 0 1000 1360" font-family="DejaVu Sans, Verdana, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3a3a3a"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d32f2f"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="1360" fill="#ffffff"/>
+
+  <style>
+    .box { stroke:#3a3a3a; stroke-width:1.6; rx:10; }
+    .lbl { font-size:19px; fill:#1a1a1a; text-anchor:middle; }
+    .lbl-b { font-size:19px; font-weight:bold; fill:#1a1a1a; text-anchor:middle; }
+    .sub  { font-size:14.5px; fill:#333; text-anchor:middle; }
+    .subL { font-size:14.5px; fill:#333; text-anchor:start; }
+    .edge { stroke:#3a3a3a; stroke-width:2; fill:none; marker-end:url(#arrow); }
+    .edgeRed { stroke:#d32f2f; stroke-width:2.4; fill:none; marker-end:url(#arrowRed); stroke-dasharray:7,4; }
+    .redlbl { font-size:15px; fill:#d32f2f; font-weight:bold; text-anchor:middle; }
+  </style>
+
+  <!-- 1. Input Image -->
+  <rect class="box" x="330" y="16" width="340" height="64" fill="#dce8fb"/>
+  <text class="lbl-b" x="500" y="55">Input Image</text>
+
+  <line class="edge" x1="500" y1="80" x2="500" y2="112"/>
+
+  <!-- 2. Agent 1 -->
+  <rect class="box" x="220" y="112" width="560" height="92" fill="#dce8fb"/>
+  <text class="lbl-b" x="500" y="140">Agent 1 — Occlusion Agent</text>
+  <text class="sub"   x="500" y="164">GPT-5 vision names subject &amp; occluder</text>
+  <text class="sub"   x="500" y="184">(auto-detect, or optional INPUT_PROMPT hint)</text>
+
+  <!-- fan out -->
+  <line class="edge" x1="400" y1="204" x2="255" y2="240"/>
+  <line class="edge" x1="600" y1="204" x2="745" y2="240"/>
+
+  <!-- 3a. InstaFormer -->
+  <rect class="box" x="60" y="240" width="390" height="92" fill="#fbe4c6"/>
+  <text class="lbl-b" x="255" y="270">InstaFormer</text>
+  <text class="sub"   x="255" y="292">Occlusion order + depth order</text>
+  <text class="sub"   x="255" y="312">IoU-matched to Agent 1's subject (no click)</text>
+
+  <!-- 3b. SAM3 -->
+  <rect class="box" x="550" y="240" width="390" height="92" fill="#fbe4c6"/>
+  <text class="lbl-b" x="745" y="270">SAM3 (primary)</text>
+  <text class="sub"   x="745" y="292">Text-prompted segmentation of</text>
+  <text class="sub"   x="745" y="312">Agent 1's named subject/occluder</text>
+
+  <!-- converge -->
+  <line class="edge" x1="255" y1="332" x2="440" y2="368"/>
+  <line class="edge" x1="745" y1="332" x2="560" y2="368"/>
+
+  <!-- 4. Mask Fusion -->
+  <rect class="box" x="220" y="368" width="560" height="92" fill="#dcf0dc"/>
+  <text class="lbl-b" x="500" y="398">Mask Fusion + Area-Ratio Sanity Trim</text>
+  <text class="sub"   x="500" y="420">Priority fusion (SAM3-text &gt; InstaFormer);</text>
+  <text class="sub"   x="500" y="440">rejects/trims an oversized occluder mask</text>
+
+  <line class="edge" x1="500" y1="460" x2="500" y2="492"/>
+
+  <!-- 5. Hidden region -->
+  <rect class="box" x="220" y="492" width="560" height="72" fill="#dcf0dc"/>
+  <text class="lbl-b" x="500" y="522">Hidden-Region Computation</text>
+  <text class="sub"   x="500" y="546">dilate(occluder) \ visible</text>
+
+  <line class="edge" x1="500" y1="564" x2="500" y2="596"/>
+
+  <!-- 6. Flux Fill -->
+  <rect class="box" x="220" y="596" width="560" height="84" fill="#fbdada" id="fluxbox"/>
+  <text class="lbl-b" x="500" y="628">Agent 2 — FLUX.1-Fill-dev Inpainting</text>
+  <text class="sub"   x="500" y="652">Diffusion inpaint of the hidden region</text>
+
+  <line class="edge" x1="500" y1="680" x2="500" y2="712"/>
+
+  <!-- 7. Reviewer -->
+  <rect class="box" x="220" y="712" width="560" height="92" fill="#fbdada" id="reviewbox"/>
+  <text class="lbl-b" x="500" y="742">Agent 3 — GPT-Vision Reviewer</text>
+  <text class="sub"   x="500" y="764">Scores the attempt (0-10)</text>
+  <text class="sub"   x="500" y="784">score &lt; 7.0 and retries left → regenerate</text>
+
+  <!-- RED retry loop: right side of reviewer box back up to right side of Flux box -->
+  <path class="edgeRed" d="M 782 758 C 900 758, 900 638, 782 638"/>
+  <text class="redlbl" x="905" y="702" transform="rotate(90 905 702)">retry — score &lt; 7.0</text>
+
+  <!-- forward continue -->
+  <line class="edge" x1="500" y1="804" x2="500" y2="836"/>
+  <text class="sub" x="620" y="826">score ≥ 7.0, or best-of-N kept</text>
+
+  <!-- 8. SAM3 post-seg -->
+  <rect class="box" x="220" y="836" width="560" height="72" fill="#dce8fb"/>
+  <text class="lbl-b" x="500" y="866">SAM3 Post-Segmentation Refinement</text>
+  <text class="sub"   x="500" y="890">Re-segments Flux's output to clean the silhouette</text>
+
+  <line class="edge" x1="500" y1="908" x2="500" y2="940"/>
+
+  <!-- 9. Final -->
+  <rect class="box" x="220" y="940" width="560" height="72" fill="#dce8fb"/>
+  <text class="lbl-b" x="500" y="970">Final RGBA Composite</text>
+  <text class="sub"   x="500" y="994">Subject cutout / final / comparison outputs</text>
+
+  <!-- legend -->
+  <rect x="140" y="1060" width="26" height="26" fill="#dce8fb" stroke="#3a3a3a"/>
+  <text class="subL" x="176" y="1079" text-anchor="start">I/O &amp; orchestration stages</text>
+  <rect x="140" y="1096" width="26" height="26" fill="#fbe4c6" stroke="#3a3a3a"/>
+  <text class="subL" x="176" y="1115" text-anchor="start">Detection / segmentation models</text>
+  <rect x="140" y="1132" width="26" height="26" fill="#dcf0dc" stroke="#3a3a3a"/>
+  <text class="subL" x="176" y="1151" text-anchor="start">Mask fusion &amp; geometry</text>
+  <rect x="140" y="1168" width="26" height="26" fill="#fbdada" stroke="#3a3a3a"/>
+  <text class="subL" x="176" y="1187" text-anchor="start">Generation &amp; review (retry loop)</text>
+  <line x1="140" y1="1212" x2="176" y2="1212" class="edgeRed"/>
+  <text class="subL" x="186" y="1217" text-anchor="start">retry / feedback path</text>
+</svg>

@@ -59,6 +59,17 @@ InstaFormer/
 cuda-11.8-local/
 detectron2/
 
+# ── LISA (legacy, unused at runtime — vendored upstream clone + its own
+# venv, multi-GB; see SETUP.md). Our custom CLI wrapper is tracked below. ─
+.lisa-venv/
+LISA/*
+!LISA/predict_single.py
+
+# ── Hunyuan3D-2.1 (optional 3D-generation step — vendored upstream clone,
+# multi-GB; see SETUP.md). Our custom CLI wrapper is tracked below. ──────
+Hunyuan3D-2.1/*
+!Hunyuan3D-2.1/generate_3d.py
+
 # ── Backup / archive artifacts ─────────────────────────────────────────
 output.zip
 results_backup/

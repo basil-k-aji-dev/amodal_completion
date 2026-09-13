@@ -1,5 +1,10 @@
 # amodal_completion
 
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![SAM3](https://img.shields.io/badge/segmentation-SAM3-orange)
+![FLUX.1--Fill](https://img.shields.io/badge/inpainting-FLUX.1--Fill--dev-purple)
+
 Open-world amodal appearance completion. Given an image with an occluded object, this pipeline segments the occluder, infers what's hidden, and inpaints the missing pixels — producing a clean RGBA cutout of the fully-revealed subject.
 
 Driven by **SAM3** (segmentation) + **GPT-5 Responses API** (scene reasoning) + **InstaOrder** (occlusion ordering) + **FLUX.1-Fill-dev** (inpainting), wrapped in an iterative off-frame extension loop adapted from Jiang Ao et al., CVPR 2025.

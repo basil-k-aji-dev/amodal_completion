@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Amodal completion via GPT-5 + SDXL + LangGraph"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 dependencies = [
     "openai>=1.30",
     "python-dotenv>=1.0",

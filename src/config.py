@@ -1,5 +1,17 @@
+import os
+
+# Absolute paths below are environment-overridable so the pipeline runs on a
+# machine other than the one it was developed on. Each falls back to a path
+# relative to the repository root rather than a hardcoded home directory.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _env_path(var, default):
+    return os.environ.get(var, default)
+
+
 # ── Input ─────────────────────────────────────────────────────────────────────
-IMAGE_PATH = "/home/basil-k-aji/Desktop/Workspace/RD/website/animal-8518802_640_deer.jpg"
+IMAGE_PATH = _env_path("AMODAL_IMAGE_PATH", os.path.join(_PROJECT_ROOT, "input.jpg"))
 
 # Optional hint telling Agent 1 what the occluded subject is (e.g. "horse").
 # Default is empty — Agent 1 auto-detects the occluded object itself from
@@ -180,8 +192,8 @@ OCCLUDER_PROXIMITY_PX   = 60
 # default; each run costs several extra minutes of GPU time for a
 # shape+texture pass most callers won't want on every single image.
 RUN_3D_GENERATION_HUNYUAN3D = False
-HUNYUAN3D_REPO_DIR = "/home/ubuntu/Workspace/amodal_completion/Hunyuan3D-2.1"
-HUNYUAN3D_CONDA_ENV = "hunyuan3d"
+HUNYUAN3D_REPO_DIR = _env_path("HUNYUAN3D_REPO_DIR", os.path.join(_PROJECT_ROOT, "Hunyuan3D-2.1"))
+HUNYUAN3D_CONDA_ENV = _env_path("HUNYUAN3D_CONDA_ENV", "hunyuan3d")
 
 # ── Mask dilation ─────────────────────────────────────────────────────────────
 MASK_EXPAND = 20    # px for elliptical dilation of the occluder mask
@@ -234,12 +246,14 @@ AISFORMER_ENABLED    = False   # MINIMAL pipeline: AISFormer OFF (no SAM3 featur
 # both fields stay in OCCLUSION_SCHEMA and the prompt regardless of this flag.
 USE_OCCLUDER_CLICK      = False
 USE_INSTAFORMER         = True
-INSTAFORMER_REPO_DIR    = "/home/ubuntu/Workspace/amodal_completion/InstaFormer"
-INSTAFORMER_VENV_PYTHON = "/home/ubuntu/Workspace/amodal_completion/.instaformer-venv/bin/python"
+INSTAFORMER_REPO_DIR    = _env_path("INSTAFORMER_REPO_DIR", os.path.join(_PROJECT_ROOT, "InstaFormer"))
+INSTAFORMER_VENV_PYTHON = _env_path("INSTAFORMER_VENV_PYTHON", os.path.join(_PROJECT_ROOT, ".instaformer-venv", "bin", "python"))
 INSTAFORMER_CONFIG      = ("configs/instaorder/occlusion_depth/all/swin/"
                            "maskformer2_swin_large_IN21k_384_bs16_100ep.yaml")
-INSTAFORMER_CKPT        = ("/home/ubuntu/Workspace/amodal_completion/InstaFormer/"
-                           "checkpoints/instaformer_od_swinl_200.pth")
+INSTAFORMER_CKPT        = _env_path(
+    "INSTAFORMER_CKPT",
+    os.path.join(INSTAFORMER_REPO_DIR, "checkpoints", "instaformer_od_swinl_200.pth"),
+)
 
 # ── Multi-model occluder-mask fusion ──────────────────────────────────────────
 # Each candidate source produces a binary occluder-mask. Available sources

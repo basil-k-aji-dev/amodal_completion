@@ -1,7 +1,7 @@
 [project]
-name = "amodal-test3"
+name = "amodal-completion"
 version = "0.1.0"
-description = "Amodal completion via GPT-5 + SDXL + LangGraph"
+description = "Open-world amodal appearance completion: SAM3 + GPT-5 + InstaOrder + FLUX.1-Fill"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
